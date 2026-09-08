@@ -8,10 +8,12 @@ import contextlib
 import json
 import logging
 import os
+import time
+
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 
@@ -21,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
+_HTTP_CALL_ERRORS = {
+    401: "Error: peer '{agent}' rejected auth (HTTP {code}). Check the configured token.",
+    403: "Error: peer '{agent}' rejected auth (HTTP {code}). Check the configured token.",
+    429: "Error: peer '{agent}' rate limited us (HTTP {code}). Retry later.",
+}
 
 
 def _load_config() -> dict:
@@ -141,8 +148,228 @@ def _reply_text_from_result(result: Any) -> str:
     return protocol.extract_text((result.get("status", {}) or {}).get("message") or result)
 
 
-_AUTH_ERR = "Error: peer '{agent}' rejected auth (HTTP {code}). Check the configured token."
-_HTTP_CALL_ERRORS = {401: _AUTH_ERR, 403: _AUTH_ERR, 429: "Error: peer '{agent}' rate limited us (HTTP 429). Retry later."}
+
+# --------------------------------------------------------------------------
+# Async task flow (A2A v1.0 §3.1.1/§3.2.2): submit / poll / await / cancel
+# --------------------------------------------------------------------------
+
+def _short_state(state: str) -> str:
+    return state.removeprefix("TASK_STATE_").lower().replace("_", "-")
+
+
+def _interface_tenant(card: Optional[dict], peer: dict) -> str:
+    if isinstance(card, dict):
+        iface = _select_jsonrpc_interface(card)
+        if iface and iface.get("tenant"):
+            return str(iface["tenant"])
+    return str(peer.get("tenant") or "")
+
+
+def _rpc_request(peer: dict, method: str, params: dict, timeout: Optional[int] = None) -> dict:
+    """One JSON-RPC round trip to a peer. Returns the full response object."""
+    base_url = peer.get("url", "")
+    headers = _auth_header(peer.get("auth", {}) or {})
+    card = None
+    try:
+        card = _fetch_card(base_url, headers, min(int(peer.get("timeout", _DEFAULT_TIMEOUT)), 30))
+    except Exception:
+        pass
+    body = {
+        "jsonrpc": "2.0",
+        "id": protocol.new_task_id(),
+        "method": method,
+        "params": params,
+    }
+    tenant = _interface_tenant(card, peer)
+    if tenant and "tenant" not in body["params"]:
+        body["params"]["tenant"] = tenant
+    return _http_post_json(
+        _rpc_url(base_url, card), body, headers,
+        int(timeout if timeout is not None else peer.get("timeout", _DEFAULT_TIMEOUT)),
+    )
+
+
+def _peer_rpc_error(resp: dict, agent_label: str) -> str:
+    err = resp.get("error") or {}
+    code = err.get("code", "")
+    return f"Error: peer '{agent_label}' returned {code}: {err.get('message', err)}"
+
+
+def a2a_submit(args: dict, **_: Any) -> str:
+    """Submit a task to a peer without blocking (SendMessage + returnImmediately).
+
+    Returns the taskId/contextId for use with a2a_get_task / a2a_await /
+    a2a_cancel. Requires an A2A v1.0 peer that honors returnImmediately; if
+    the peer replies with a terminal task anyway, that reply is returned.
+    """
+    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+    message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
+    context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
+    if not agent or not message:
+        return "Error: both 'agent' and 'message' are required."
+
+    peer = _resolve_peer(agent)
+    if not peer or not peer.get("url"):
+        return f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in config.yaml or pass a full http(s):// URL."
+
+    ctx = context_id or protocol.new_context_id()
+    safe_message = security.redact_outbound(message)
+    params = {
+        "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
+        "configuration": {"returnImmediately": True},
+    }
+    try:
+        resp = _rpc_request(peer, "SendMessage", params)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
+        return f"Error: submit to '{agent}' failed — HTTP {e.code}."
+    except Exception as e:
+        return f"Error: submit to '{agent}' failed — {e}."
+    if "error" in resp:
+        return _peer_rpc_error(resp, agent)
+
+    payload = protocol.unwrap_send_message_response(resp.get("result", {}))
+    if not isinstance(payload, dict):
+        return f"Error: peer '{agent}' returned a non-task response to an async submit."
+    status = payload.get("status") or {}
+    state = str(status.get("state", ""))
+    task_id = str(payload.get("id", ""))
+    reply_ctx = str(payload.get("contextId", ctx))
+
+    # Peer ignored returnImmediately and answered synchronously — hand back
+    # the completed reply rather than a dangling task id.
+    if state in ("completed", "TASK_STATE_COMPLETED", "failed", "TASK_STATE_FAILED",
+                 "canceled", "TASK_STATE_CANCELED", "rejected", "TASK_STATE_REJECTED"):
+        text = _reply_text_from_result(payload) or "(no text reply)"
+        return f"[{agent} · context {reply_ctx} · {_short_state(state)}]\n{text}"
+
+    if not task_id:
+        return f"Error: peer '{agent}' accepted the message but returned no task id."
+
+    protocol.persist_message(reply_ctx, "user", safe_message, task_id)
+    protocol.metrics.outbound_total += 1
+    return (
+        f"[{agent} · task {task_id} · context {reply_ctx} · "
+        f"{_short_state(state) or 'submitted'}]\n"
+        f"Task accepted asynchronously. Poll with a2a_get_task(agent='{agent}', "
+        f"task_id='{task_id}') or block on a2a_await."
+    )
+
+
+def a2a_get_task(args: dict, **_: Any) -> str:
+    """Fetch a task's current state from a peer (GetTask). Non-blocking."""
+    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+    task_id = str(args.get("task_id") or args.get("taskId") or args.get("id") or "").strip()
+    if not agent or not task_id:
+        return "Error: both 'agent' and 'task_id' are required."
+    peer = _resolve_peer(agent)
+    if not peer or not peer.get("url"):
+        return f"Error: unknown agent '{agent}'."
+    try:
+        resp = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=30)
+    except Exception as e:
+        return f"Error: GetTask on '{agent}' failed — {e}."
+    if "error" in resp:
+        return _peer_rpc_error(resp, agent)
+    payload = resp.get("result", {})
+    if not isinstance(payload, dict):
+        return f"Error: unexpected GetTask response from '{agent}'."
+    status = payload.get("status") or {}
+    state = _short_state(str(status.get("state", ""))) or "unknown"
+    lines = [f"[{agent} · task {payload.get('id', task_id)} · {state}]"]
+    msg = status.get("message")
+    if msg:
+        txt = protocol.extract_text(msg)
+        if txt:
+            lines.append(txt[:2000])
+    for artifact in payload.get("artifacts", []) or []:
+        txt = protocol.extract_text(artifact)
+        if txt:
+            lines.append(f"[artifact] {txt[:4000]}")
+    return "\n".join(lines)
+
+
+def a2a_await(args: dict, **_: Any) -> str:
+    """Block until a submitted task reaches a terminal state (poll loop).
+
+    Polls GetTask every ``interval`` seconds (default 5) until the task is
+    terminal or ``timeout`` (default 600s) elapses. Use for tasks you want
+    the result of now; use a2a_get_task for fire-and-forget polling.
+    """
+    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+    task_id = str(args.get("task_id") or args.get("taskId") or args.get("id") or "").strip()
+    try:
+        timeout = max(5, min(int(args.get("timeout") or 600), 3600))
+    except (TypeError, ValueError):
+        timeout = 600
+    try:
+        interval = max(1, min(int(args.get("interval") or 5), 60))
+    except (TypeError, ValueError):
+        interval = 5
+    if not agent or not task_id:
+        return "Error: both 'agent' and 'task_id' are required."
+    peer = _resolve_peer(agent)
+    if not peer or not peer.get("url"):
+        return f"Error: unknown agent '{agent}'."
+
+    deadline = time.time() + timeout
+    last_state = ""
+    while True:
+        try:
+            resp = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=30)
+        except Exception as e:
+            return f"Error: poll of '{agent}' failed — {e}."
+        if "error" in resp:
+            return _peer_rpc_error(resp, agent)
+        payload = resp.get("result", {})
+        if isinstance(payload, dict):
+            status = payload.get("status") or {}
+            state = str(status.get("state", ""))
+            if state != last_state:
+                logger.debug("A2A await: task %s now %s", task_id, state)
+                last_state = state
+            short = _short_state(state)
+            if short in ("completed", "failed", "canceled", "rejected", "input-required"):
+                text = _reply_text_from_result(payload) or "(no text reply)"
+                header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
+                body = text
+                if short == "input-required":
+                    ctx = str(payload.get("contextId", ""))
+                    body += f"\n\n(Peer needs input — reply via a2a_submit with context_id '{ctx}'.)"
+                return f"{header}\n{body}"
+        if time.time() >= deadline:
+            return (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
+                    f"Call a2a_await again or check a2a_get_task.")
+        time.sleep(interval)
+
+
+def a2a_cancel(args: dict, **_: Any) -> str:
+    """Request cancellation of a previously submitted task (CancelTask)."""
+    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+    task_id = str(args.get("task_id") or args.get("taskId") or args.get("id") or "").strip()
+    if not agent or not task_id:
+        return "Error: both 'agent' and 'task_id' are required."
+    peer = _resolve_peer(agent)
+    if not peer or not peer.get("url"):
+        return f"Error: unknown agent '{agent}'."
+    try:
+        resp = _rpc_request(peer, "CancelTask", {"id": task_id}, timeout=30)
+    except Exception as e:
+        return f"Error: CancelTask on '{agent}' failed — {e}."
+    if "error" in resp:
+        return _peer_rpc_error(resp, agent)
+    payload = resp.get("result", {})
+    state = ""
+    if isinstance(payload, dict):
+        state = _short_state(str((payload.get("status") or {}).get("state", "")))
+    return f"[{agent} · task {task_id} · {state or 'cancel requested'}]"
+
+
+# --------------------------------------------------------------------------
+# Tool handlers
+# --------------------------------------------------------------------------
+
 
 def a2a_discover(args: dict, **_: Any) -> str:
     """Fetch and summarize the Agent Card at ``url``."""
@@ -281,50 +508,228 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
                 results.append((name, f"Error: {e}"))
     results.sort(key=lambda r: r[0])  # deterministic output
     successes = [(name, reply) for name, reply in results if not reply.startswith("Error:")]
+    def _all_failed() -> str:
+        lines = ["All peers failed:"]
+        lines.extend(f"  {name}: {reply}" for name, reply in results)
+        return "\n".join(lines)
+
     if mode in ("best", "first"):
         if not successes:
-            return "\n".join(["All peers failed:"] + [f"  {name}: {reply}" for name, reply in results])
-        name, reply = max(successes, key=lambda r: len(r[1])) if mode == "best" else successes[0]
-        return f"[{mode}: {name}]\n{reply}"
-    return "\n".join([f"Orchestrated '{capability}' to {len(matches)} peer(s):"]
-                     + [line for name, reply in results for line in (f"\n--- {name} ---", reply)])
+
+            return _all_failed()
+        best = max(successes, key=lambda r: len(r[1]))
+        return f"[best: {best[0]}]\n{best[1]}"
+    elif mode == "first":
+        if not successes:
+            return _all_failed()
+        name, reply = successes[0]
+        return f"[first: {name}]\n{reply}"
+    else:  # mode == "all"
+        lines = [f"Orchestrated '{capability}' to {len(matches)} peer(s):"]
+        for name, reply in results:
+            lines.append(f"\n--- {name} ---")
+            lines.append(reply)
+        return "\n".join(lines)
 
 
-def _str(description: str) -> dict:
-    return {"type": "string", "description": description}
+# --------------------------------------------------------------------------
+# Tool schemas + registration
+# --------------------------------------------------------------------------
 
-
-# name -> (handler, description, properties, required)
-_TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
-    "a2a_discover": (a2a_discover,
-                     "Fetch and summarize another agent's A2A Agent Card from a URL (its name, description, "
-                     "capabilities, and skills). Use this to find out what a remote agent can do before calling it.",
-                     {"url": _str("Base URL of the remote A2A agent, e.g. http://localhost:9999")}, ["url"]),
-    "a2a_call": (a2a_call,
-                 "Send a natural-language task to a remote A2A agent and return its reply. The agent is a peer "
-                 "(any A2A-compliant framework), not a sub-agent you control. Pass 'context_id' from a previous "
-                 "reply to continue a multi-turn exchange.",
-                 {"agent": _str("Configured peer name (from a2a_agents) or a full http(s):// URL."),
-                  "message": _str("The task / message to send the peer, in natural language."),
-                  "context_id": _str("Optional: context id from a prior reply, to continue the conversation.")},
-                 ["agent", "message"]),
-    "a2a_list": (a2a_list, "List configured A2A peer agents, persisted A2A conversations, and metrics.", {}, []),
-    "a2a_history": (a2a_history,
-                    "Recall a persisted A2A conversation transcript by context_id (survives restarts and "
-                    "context compaction). Use a2a_list to see known context ids.",
-                    {"context_id": _str("Context id of the conversation to recall."),
-                     "limit": {"type": "integer", "description": "Max messages to return (default 50, max 200)."}},
-                    ["context_id"]),
-    "a2a_orchestrate": (a2a_orchestrate,
-                        "Fan-out a task to multiple peer agents by capability. Peers are matched from config.yaml "
-                        "a2a_agents.*.capabilities. Modes: 'all' (return all replies), 'first' (first successful), "
-                        "'best' (longest successful reply).",
-                        {"capability": _str("Capability to match (e.g. 'research', 'code') or '*' for all peers."),
-                         "message": _str("The task to send to all matching peers."),
-                         "mode": {"type": "string", "enum": ["all", "first", "best"], "description": "How to aggregate results. Default: 'all'."},
-                         "context_id": _str("Optional: shared context id for all peers.")},
-                        ["capability", "message"]),
+_FunctionSchema = TypedDict("_FunctionSchema", {"name": str, "description": str, "parameters": dict[str, Any]}, total=False)
+_ToolSchema = TypedDict("_ToolSchema", {"type": str, "function": _FunctionSchema}, total=False)
+_SCHEMAS: dict[str, _ToolSchema] = {
+    "a2a_discover": {
+        "type": "function",
+        "function": {
+            "name": "a2a_discover",
+            "description": (
+                "Fetch and summarize another agent's A2A Agent Card from a URL "
+                "(its name, description, capabilities, and skills). Use this to "
+                "find out what a remote agent can do before calling it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Base URL of the remote A2A agent, e.g. http://localhost:9999"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    "a2a_call": {
+        "type": "function",
+        "function": {
+            "name": "a2a_call",
+            "description": (
+                "Send a natural-language task to a remote A2A agent and BLOCK "
+                "until it replies. The agent is a peer (any A2A-compliant "
+                "framework), not a sub-agent you control. Pass 'context_id' "
+                "from a previous reply to continue a multi-turn exchange. "
+                "For long-running jobs (more than a minute or so), use "
+                "a2a_submit instead so you are not parked waiting. The remote "
+                "agent starts in ITS OWN default working directory, not yours; "
+                "if the task involves files or repos, state the absolute path "
+                "expectations explicitly in the message."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name (from a2a_agents) or a full http(s):// URL."},
+                    "message": {"type": "string", "description": "The task / message to send the peer, in natural language."},
+                    "context_id": {"type": "string", "description": "Optional: context id from a prior reply, to continue the conversation."},
+                },
+                "required": ["agent", "message"],
+            },
+        },
+    },
+    "a2a_list": {
+        "type": "function",
+        "function": {
+            "name": "a2a_list",
+            "description": "List configured A2A peer agents, persisted A2A conversations, and metrics.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    "a2a_history": {
+        "type": "function",
+        "function": {
+            "name": "a2a_history",
+            "description": (
+                "Recall a persisted A2A conversation transcript by context_id "
+                "(survives restarts and context compaction). Use a2a_list to "
+                "see known context ids."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "context_id": {"type": "string", "description": "Context id of the conversation to recall."},
+                    "limit": {"type": "integer", "description": "Max messages to return (default 50, max 200)."},
+                },
+                "required": ["context_id"],
+            },
+        },
+    },
+    "a2a_orchestrate": {
+        "type": "function",
+        "function": {
+            "name": "a2a_orchestrate",
+            "description": (
+                "Fan-out a task to multiple peer agents by capability. Peers are "
+                "matched from config.yaml a2a_agents.*.capabilities. Modes: 'all' "
+                "(return all replies), 'first' (first successful), 'best' (longest "
+                "successful reply)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "capability": {"type": "string", "description": "Capability to match (e.g. 'research', 'code') or '*' for all peers."},
+                    "message": {"type": "string", "description": "The task to send to all matching peers."},
+                    "mode": {"type": "string", "enum": ["all", "first", "best"], "description": "How to aggregate results. Default: 'all'."},
+                    "context_id": {"type": "string", "description": "Optional: shared context id for all peers."},
+                },
+                "required": ["capability", "message"],
+            },
+        },
+    },
+    "a2a_submit": {
+        "type": "function",
+        "function": {
+            "name": "a2a_submit",
+            "description": (
+                "Submit a task to a remote A2A agent WITHOUT waiting for it to "
+                "finish (async, non-blocking). Returns a task_id immediately. "
+                "Typical workflow for a long job: a2a_submit, do other useful "
+                "work in the meantime, then a2a_await (or poll with "
+                "a2a_get_task) to collect the result; a2a_cancel aborts it. "
+                "Do NOT call a2a_await immediately after submitting unless you "
+                "intend to park on this job — that is what a2a_call does. Use "
+                "this instead of a2a_call whenever the job may take more than "
+                "a minute. The remote agent starts in ITS OWN default working "
+                "directory, not yours; if the task involves files or repos, "
+                "state the absolute path expectations explicitly in the message."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name (from a2a_agents) or a full http(s):// URL."},
+                    "message": {"type": "string", "description": "The task / message to send the peer, in natural language."},
+                    "context_id": {"type": "string", "description": "Optional: context id from a prior reply, to continue the conversation."},
+                },
+                "required": ["agent", "message"],
+            },
+        },
+    },
+    "a2a_get_task": {
+        "type": "function",
+        "function": {
+            "name": "a2a_get_task",
+            "description": (
+                "Check the current state of a previously submitted async task "
+                "(non-blocking snapshot). Returns state plus any status "
+                "message or artifacts produced so far."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name or full http(s):// URL the task was submitted to."},
+                    "task_id": {"type": "string", "description": "Task id returned by a2a_submit."},
+                },
+                "required": ["agent", "task_id"],
+            },
+        },
+    },
+    "a2a_await": {
+        "type": "function",
+        "function": {
+            "name": "a2a_await",
+            "description": (
+                "Block until a previously submitted async task reaches a "
+                "terminal state, polling the peer. Returns the final result. "
+                "Times out after 'timeout' seconds (default 600) with the "
+                "task still running — call again to keep waiting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name or full http(s):// URL the task was submitted to."},
+                    "task_id": {"type": "string", "description": "Task id returned by a2a_submit."},
+                    "timeout": {"type": "integer", "description": "Max seconds to wait (default 600, max 3600)."},
+                    "interval": {"type": "integer", "description": "Seconds between polls (default 5)."},
+                },
+                "required": ["agent", "task_id"],
+            },
+        },
+    },
+    "a2a_cancel": {
+        "type": "function",
+        "function": {
+            "name": "a2a_cancel",
+            "description": (
+                "Request cancellation of a previously submitted async task on "
+                "a remote peer. Best-effort: the peer may not interrupt "
+                "in-flight work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name or full http(s):// URL the task was submitted to."},
+                    "task_id": {"type": "string", "description": "Task id returned by a2a_submit."},
+                },
+                "required": ["agent", "task_id"],
+            },
+        },
+    },
 }
+
+_TOOLS = {
+    name: (globals()[name], schema["function"].get("description", ""),
+           schema["function"].get("parameters", {}).get("properties", {}),
+           schema["function"].get("parameters", {}).get("required", []))
+    for name, schema in _SCHEMAS.items()
+}
+
+_HANDLERS = {name: entry[0] for name, entry in _TOOLS.items()}
 
 
 def _a2a_tools_available() -> bool:
@@ -361,9 +766,4 @@ def register_tools(ctx) -> None:
                           emoji="\U0001f9e9", check_fn=_a2a_tools_available)  # puzzle piece
 
 
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import TypedDict  # noqa: F401,E402
 # ---- END PLUGIN-COMPAT ----
