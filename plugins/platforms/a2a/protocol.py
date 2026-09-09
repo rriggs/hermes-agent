@@ -6,7 +6,12 @@ Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 from __future__ import annotations
 
 import json
+
+import copy
+import logging
+
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -16,8 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+
 from gateway.platforms._shared import coerce_port as _coerce_int
 from hermes_constants import get_hermes_home
+
+logger = logging.getLogger(__name__)
+
+PROTOCOL_VERSION = "1.0"
+
 
 PROTOCOL_VERSION = "1.0"
 
@@ -290,15 +301,160 @@ metrics = Metrics()
 
 
 class TaskStore:
-    """In-memory A2A tasks, kept after completion for tasks/get. Records carry agent slug +
-    tenant; readers pass a scope and get not-found outside it (spec authz rule)."""
+
+    """In-memory store of A2A tasks, kept after completion for tasks/get.
+
+    Records carry the routed agent slug and tenant. All read/write helpers accept
+    optional scope values and return not-found when the task exists but is not
+    visible in that scope, satisfying the spec's authorization scoping rule.
+
+    Durability: when ``db_path`` resolves (default ``$A2A_TASKS_DB`` or
+    ``~/.hermes/a2a_tasks.db``), every write is mirrored to SQLite (WAL mode)
+    so completed tasks survive gateway restarts. On startup, persisted
+    terminal records are reloaded into the queryable store; non-terminal
+    records are marked failed ("[gateway restarted]") — we support surviving
+    caller disconnects and post-completion restarts, not mid-tool crashes.
+    """
+
 
     _MAX_TERMINAL = 500
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: Optional[str] = None) -> None:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        self._db_path = self._resolve_db_path(db_path)
+        self._recover_from_db()
+
+    @staticmethod
+    def _resolve_db_path(db_path: Optional[str]) -> str:
+        if db_path:
+            return db_path
+        env = os.getenv("A2A_TASKS_DB", "").strip()
+        if env:
+            return env
+        try:
+            from hermes_constants import get_hermes_home
+            base = get_hermes_home()
+        except Exception:
+            base = os.path.expanduser("~/.hermes")
+        return os.path.join(base, "a2a_tasks.db")
+
+    # ── SQLite durability ─────────────────────────────────────────────────
+
+    def _open_db(self) -> "sqlite3.Connection":
+        con = sqlite3.connect(self._db_path, timeout=10)
+        con.execute("PRAGMA journal_mode=WAL")
+        return con
+
+    def _ensure_db(self, con: "sqlite3.Connection") -> None:
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS a2a_tasks (
+                task_id TEXT PRIMARY KEY,
+                context_id TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                agent_slug TEXT NOT NULL DEFAULT '',
+                tenant TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL,
+                reply TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                created_iso TEXT NOT NULL,
+                completed_at REAL
+            )"""
+        )
+
+    def _recover_from_db(self) -> None:
+        """Load persisted terminal tasks; fail non-terminal ones (restart)."""
+        if not self._db_path:
+            return
+        try:
+            parent = os.path.dirname(self._db_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if not os.path.exists(self._db_path):
+                return  # first boot — nothing to recover
+            con = self._open_db()
+            try:
+                self._ensure_db(con)
+                rows = con.execute(
+                    "SELECT task_id, context_id, peer, agent_slug, tenant, state,"
+                    " reply, created_at, created_iso, completed_at FROM a2a_tasks"
+                ).fetchall()
+            finally:
+                con.close()
+        except Exception:
+            logger.debug("A2A: task-store recovery failed", exc_info=True)
+            return
+
+        recovered = 0
+        restarted = 0
+        for row in rows:
+            rec = {
+                "task_id": row[0], "context_id": row[1], "peer": row[2],
+                "agent_slug": row[3], "tenant": row[4], "state": row[5],
+                "reply": row[6], "created_at": row[7], "created_iso": row[8],
+                "push_url": "", "push_config_id": "",
+            }
+            if row[9] is not None:
+                rec["completed_at"] = row[9]
+            if rec["state"] not in TERMINAL_STATES:
+                # Gateway died mid-task; nobody is coming to finish it.
+                rec["state"] = STATE_FAILED
+                rec["reply"] = "[gateway restarted before task completed]"
+                rec["completed_at"] = time.time()
+                restarted += 1
+            with self._lock:
+                if rec["task_id"] not in self._tasks:
+                    self._tasks[rec["task_id"]] = rec
+                    recovered += 1
+        # Enforce the terminal cap against the reloaded set.
+        with self._lock:
+            self._trim_locked()
+        if recovered or restarted:
+            logger.info("A2A: recovered %d task(s) from %s (%d failed by restart)",
+                        recovered, self._db_path, restarted)
+
+    def _persist(self, rec: dict) -> None:
+        """Best-effort mirror of one record to SQLite. Never raises."""
+        if not self._db_path:
+            return
+        try:
+            con = self._open_db()
+            try:
+                self._ensure_db(con)
+                con.execute(
+                    "INSERT INTO a2a_tasks (task_id, context_id, peer, agent_slug,"
+                    " tenant, state, reply, created_at, created_iso, completed_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,"
+                    " reply=excluded.reply, completed_at=excluded.completed_at",
+                    (
+                        rec["task_id"], rec["context_id"], rec.get("peer", ""),
+                        rec.get("agent_slug", ""), rec.get("tenant", ""),
+                        rec["state"], rec.get("reply", ""),
+                        rec.get("created_at", 0.0), rec.get("created_iso", ""),
+                        rec.get("completed_at"),
+                    ),
+                )
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            logger.debug("A2A: task persist failed", exc_info=True)
+
+    def _delete_persisted(self, task_id: str) -> None:
+        if not self._db_path:
+            return
+        try:
+            con = self._open_db()
+            try:
+                con.execute("DELETE FROM a2a_tasks WHERE task_id = ?", (task_id,))
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            logger.debug("A2A: task delete failed", exc_info=True)
+
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
@@ -326,12 +482,17 @@ class TaskStore:
                "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
             self._tasks[task_id] = rec
+        self._persist(rec)
         return dict(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
+        snapshot = None
         with self._lock:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
+                snapshot = dict(rec)
+        if snapshot:
+            self._persist(snapshot)
 
     def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
@@ -369,6 +530,10 @@ class TaskStore:
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
+
+        watchers: list[Future] = []
+        out = None
+
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
@@ -377,6 +542,7 @@ class TaskStore:
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
             out = dict(rec)
+        self._persist(out)
         for fut in watchers:
             if not fut.done():
                 fut.set_result((state, reply))
@@ -407,16 +573,38 @@ class TaskStore:
         next_offset = offset + page_size if offset + page_size < total else 0
         return (page, next_offset, total) if with_total else (page, next_offset)
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(self, timeout_seconds: int = 300,
+                     protected: Optional["set[str]"] = None) -> list[str]:
+        """Fail non-terminal tasks older than ``timeout_seconds``.
+
+        ``protected`` is a set of task ids with a live waiter (blocking HTTP
+        thread or async background finalizer). Those are exempt: the caller
+        is still connected and waiting — an orphaned task by definition has
+        nobody waiting. Async-accepted long tasks are additionally bounded by
+        their own A2A_ASYNC_TIMEOUT deadline in the finalizer thread.
+        """
+        protected = protected or set()
         with self._lock:
-            stale = [tid for tid, rec in self._tasks.items()
-                     if rec["state"] not in TERMINAL_STATES and time.time() - rec["created_at"] > timeout_seconds]
-        return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
+
+            now = time.time()
+            stale = [
+                tid for tid, rec in self._tasks.items()
+                if rec["state"] not in TERMINAL_STATES
+                and tid not in protected
+                and now - rec["created_at"] > timeout_seconds
+            ]
+        failed = []
+        for tid in stale:
+            if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]"):
+                failed.append(tid)
+        return failed
+
 
     def _trim_locked(self) -> None:
         terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
         for tid in terminal[:max(0, len(terminal) - self._MAX_TERMINAL)]:
             self._tasks.pop(tid, None)
+            self._delete_persisted(tid)
 
     @staticmethod
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:

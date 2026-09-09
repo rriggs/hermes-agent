@@ -69,6 +69,33 @@ def _reply_timeout() -> float:
         return 300.0
 
 
+
+def _profile_scoped() -> bool:
+    """True when running inside a multiplexed secondary profile's scope."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
+def _async_timeout() -> float:
+    """Max lifetime for async-accepted inbound tasks."""
+    try:
+        return max(1.0, float(os.getenv("A2A_ASYNC_TIMEOUT", "28800")))
+    except (ValueError, TypeError):
+        return 28800.0
+
+
+def _return_immediately(params: dict) -> bool:
+    """True when the caller asked for a non-blocking SendMessage accept."""
+    if bool((params.get("configuration") or {}).get("returnImmediately")):
+        return True
+    cfg = (params.get("configuration") or {}).get("taskPushNotificationConfig") or {}
+    return isinstance(cfg, dict) and bool(cfg.get("url") or (cfg.get("pushNotificationConfig") or {}).get("url"))
+
+
+
 def _default_agent_name() -> str:
     # Scope-aware: a secondary multiplex profile must not borrow the default profile's A2A_AGENT_NAME.
     name = _get_scoped_secret("A2A_AGENT_NAME", "").strip()
@@ -331,10 +358,17 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending_order.clear()
 
     def _watchdog_loop(self) -> None:
-        """Background thread that fails orphaned tasks (keeps them queryable)."""
+        """Background thread that fails orphaned tasks (keeps them queryable).
+
+        Tasks with a live waiter — a blocking HTTP thread in _await_reply or
+        an async background finalizer — are exempt. An orphan has nobody
+        waiting; these do.
+        """
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
             try:
-                for tid in self.tasks.fail_orphans(_ORPHAN_TIMEOUT):
+                with self._pending_lock:
+                    protected = set(self._pending.keys())
+                for tid in self.tasks.fail_orphans(_ORPHAN_TIMEOUT, protected=protected):
                     logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
                     protocol.metrics.tasks_failed += 1
             except Exception:
@@ -594,6 +628,12 @@ class A2AAdapter(BasePlatformAdapter):
         self._record_outcome(task_id, context_id, peer, state, reply, started=pending["started"])
         return state, reply
 
+    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
+        return self._await_future(
+            pending["future"], pending["started"] + _reply_timeout(), keepalive,
+            (protocol.STATE_FAILED, "[agent did not reply in time]"),
+        )
+
     @staticmethod
     def _await_future(fut: Future, deadline: float, keepalive, on_timeout: tuple[str, str]) -> tuple[str, str]:
         """Block until ``fut`` resolves or ``deadline`` passes (-> ``on_timeout``). ``keepalive`` runs
@@ -612,16 +652,72 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return on_timeout
 
-    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
-        return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
-                                  (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
-        task, pending = self._prepare_task(params, peer, agent=agent)
-        if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
-        return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
+        terminal, pending = self._prepare_task(params, peer, agent=agent)
+        if terminal is not None:
+            result = protocol.send_message_response(terminal) if v1_response else terminal
+            return protocol.jsonrpc_result(req_id, result)
+
+        # A2A v1.0 §3.1.1 async accept: returnImmediately (or a registered push
+        # config) means we hand back WORKING + taskId now and finalize in the
+        # background. The task's lifetime is bounded by A2A_ASYNC_TIMEOUT, not
+        # the blocking reply timeout.
+        if _return_immediately(params):
+            assert pending is not None  # terminal is None => pending is set
+            self.tasks.set_state(pending["task_id"], protocol.STATE_WORKING)
+            threading.Thread(
+                target=self._finalize_in_background,
+                args=(pending,),
+                name=f"a2a-async-{pending['task_id'][-8:]}",
+                daemon=True,
+            ).start()
+            task = protocol.build_task(
+                pending["task_id"], pending["context_id"], protocol.STATE_WORKING,
+                created_at=pending["created_iso"],
+            )
+            result = protocol.send_message_response(task) if v1_response else task
+            return protocol.jsonrpc_result(req_id, result)
+
+        state, reply = self._await_reply(pending)
+        state, reply = self._finalize_task(pending, state, reply)
+        task = protocol.build_task(
+            pending["task_id"], pending["context_id"], state, reply,
+            created_at=pending["created_iso"],
+        )
+        result = protocol.send_message_response(task) if v1_response else task
+        return protocol.jsonrpc_result(req_id, result)
+
+    def _finalize_in_background(self, pending: dict) -> None:
+        """Wait out an async-accepted task off the HTTP thread and finalize it.
+
+        Mirrors the tail of _rpc_message_send's blocking path: await the reply
+        future (bounded by A2A_ASYNC_TIMEOUT), then record outcome, persist,
+        audit, and fire any push notification. Runs on a daemon thread so it
+        never blocks shutdown.
+        """
+        fut: Future = pending["future"]
+        deadline = pending["started"] + _async_timeout()
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                state, reply = protocol.STATE_FAILED, "[async task timed out]"
+                break
+            try:
+                state, reply = fut.result(timeout=min(remaining, 60))
+                break
+            except FuturesTimeout:
+                continue
+            except Exception:
+                state, reply = protocol.STATE_FAILED, "[agent did not reply in time]"
+                break
+        try:
+            self._finalize_task(pending, state, reply)
+        except Exception:
+            logger.exception("A2A: background finalization failed for task %s", pending["task_id"])
+
+    # ── Streaming (SSE) ───────────────────────────────────────────────────
+
 
     @staticmethod
     def _sse_headers(handler) -> None:

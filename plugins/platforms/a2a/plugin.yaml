@@ -36,6 +36,10 @@ provides_tools:
   - a2a_list
   - a2a_history
   - a2a_orchestrate
+  - a2a_submit
+  - a2a_get_task
+  - a2a_await
+  - a2a_cancel
 # requires_env / optional_env are surfaced in the `hermes config` UI via the
 # platform-plugin env var injector in hermes_cli/config.py.
 requires_env: []
