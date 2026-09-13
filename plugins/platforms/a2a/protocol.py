@@ -736,7 +736,9 @@ class TaskStore:
                     " direction, ownership, remote_state)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,"
-                    " reply=excluded.reply, completed_at=excluded.completed_at",
+                    " reply=excluded.reply, completed_at=excluded.completed_at,"
+                    " direction=excluded.direction, ownership=excluded.ownership,"
+                    " remote_state=excluded.remote_state",
                     (
                         rec["task_id"], rec["context_id"], rec.get("peer", ""),
                         rec.get("agent_slug", ""), rec.get("tenant", ""),

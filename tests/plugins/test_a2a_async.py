@@ -248,6 +248,9 @@ class TestDurableTaskStore:
         rec = store.get("t-terminal")
         assert rec is not None
         assert rec["remote_state"] == protocol.STATE_COMPLETED
+        con = sqlite3.connect(db)
+        assert con.execute("SELECT remote_state FROM a2a_tasks WHERE task_id = 't-terminal'").fetchone()[0] == protocol.STATE_COMPLETED
+        con.close()
 
     def test_trim_removes_from_db(self, tmp_path):
         db = str(tmp_path / "tasks.db")
