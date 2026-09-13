@@ -886,6 +886,8 @@ class TaskStore:
             rec["state"] = state
             rec["reply"] = reply
             rec["completed_at"] = time.time()
+            if rec.get("direction") == "outbound":
+                rec["remote_state"] = state
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
             out = dict(rec)

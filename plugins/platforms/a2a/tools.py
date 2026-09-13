@@ -404,6 +404,10 @@ def a2a_await(args: dict, **_: Any) -> str:
             short = _short_state(state)
             if short in ("completed", "failed", "canceled", "rejected", "input-required"):
                 text = _reply_text_from_result(payload) or "(no text reply)"
+                if state in protocol.TERMINAL_STATES:
+                    _task_store().complete(task_id, state, text)
+                else:
+                    _task_store().set_state(task_id, state)
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
                 body = text
                 if short == "input-required":

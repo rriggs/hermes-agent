@@ -239,6 +239,16 @@ class TestDurableTaskStore:
         assert rec["direction"] == "outbound"
         assert rec["ownership"] == "remote"
 
+    def test_outbound_terminal_state_updates_remote_state(self, tmp_path):
+        db = str(tmp_path / "tasks.db")
+        store = protocol.TaskStore(db_path=db)
+        store.create("t-terminal", "ctx", "peer", direction="outbound", ownership="remote")
+        store.set_state("t-terminal", protocol.STATE_WORKING)
+        store.complete("t-terminal", protocol.STATE_COMPLETED, "done")
+        rec = store.get("t-terminal")
+        assert rec is not None
+        assert rec["remote_state"] == protocol.STATE_COMPLETED
+
     def test_trim_removes_from_db(self, tmp_path):
         db = str(tmp_path / "tasks.db")
         store = protocol.TaskStore(db_path=db)
