@@ -37,6 +37,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
+A2A_TASK_SCHEMA_VERSION = 3
 
 # A2A v1.0 task lifecycle states.
 STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
@@ -624,8 +625,16 @@ class TaskStore:
         return con
 
     def _ensure_db(self, con: "sqlite3.Connection") -> None:
-        con.execute(
-            """CREATE TABLE IF NOT EXISTS a2a_tasks (
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            version = int(con.execute("PRAGMA user_version").fetchone()[0])
+            if version > A2A_TASK_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"A2A task database schema {version} is newer than supported "
+                    f"version {A2A_TASK_SCHEMA_VERSION}"
+                )
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_tasks (
                 task_id TEXT PRIMARY KEY,
                 context_id TEXT NOT NULL,
                 peer TEXT NOT NULL,
@@ -635,9 +644,30 @@ class TaskStore:
                 reply TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 created_iso TEXT NOT NULL,
-                completed_at REAL
-            )"""
-        )
+                completed_at REAL,
+                direction TEXT NOT NULL DEFAULT 'inbound',
+                ownership TEXT NOT NULL DEFAULT 'local',
+                remote_state TEXT NOT NULL DEFAULT ''
+            )""")
+            columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
+            for name, definition in (
+                ("direction", "TEXT NOT NULL DEFAULT 'inbound'"),
+                ("ownership", "TEXT NOT NULL DEFAULT 'local'"),
+                ("remote_state", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")
+            if version < A2A_TASK_SCHEMA_VERSION:
+                con.execute(f"PRAGMA user_version = {A2A_TASK_SCHEMA_VERSION}")
+            elif version > A2A_TASK_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"A2A task database schema {version} is newer than supported "
+                    f"version {A2A_TASK_SCHEMA_VERSION}"
+                )
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
 
     def _recover_from_db(self) -> None:
         """Load persisted terminal tasks; fail non-terminal ones (restart)."""
@@ -654,7 +684,8 @@ class TaskStore:
                 self._ensure_db(con)
                 rows = con.execute(
                     "SELECT task_id, context_id, peer, agent_slug, tenant, state,"
-                    " reply, created_at, created_iso, completed_at FROM a2a_tasks"
+                    " reply, created_at, created_iso, completed_at, direction,"
+                    " ownership, remote_state FROM a2a_tasks"
                 ).fetchall()
             finally:
                 con.close()
@@ -670,10 +701,11 @@ class TaskStore:
                 "agent_slug": row[3], "tenant": row[4], "state": row[5],
                 "reply": row[6], "created_at": row[7], "created_iso": row[8],
                 "push_url": "", "push_config_id": "",
+                "direction": row[10], "ownership": row[11], "remote_state": row[12],
             }
             if row[9] is not None:
                 rec["completed_at"] = row[9]
-            if rec["state"] not in TERMINAL_STATES:
+            if rec["state"] not in TERMINAL_STATES and rec["direction"] == "inbound":
                 # Gateway died mid-task; nobody is coming to finish it.
                 rec["state"] = STATE_FAILED
                 rec["reply"] = "[gateway restarted before task completed]"
@@ -700,8 +732,9 @@ class TaskStore:
                 self._ensure_db(con)
                 con.execute(
                     "INSERT INTO a2a_tasks (task_id, context_id, peer, agent_slug,"
-                    " tenant, state, reply, created_at, created_iso, completed_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " tenant, state, reply, created_at, created_iso, completed_at,"
+                    " direction, ownership, remote_state)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,"
                     " reply=excluded.reply, completed_at=excluded.completed_at",
                     (
@@ -709,7 +742,8 @@ class TaskStore:
                         rec.get("agent_slug", ""), rec.get("tenant", ""),
                         rec["state"], rec.get("reply", ""),
                         rec.get("created_at", 0.0), rec.get("created_iso", ""),
-                        rec.get("completed_at"),
+                        rec.get("completed_at"), rec.get("direction", "inbound"),
+                        rec.get("ownership", "local"), rec.get("remote_state", ""),
                     ),
                 )
                 con.commit()
@@ -741,7 +775,8 @@ class TaskStore:
         return True
 
     def create(self, task_id: str, context_id: str, peer: str,
-               agent_slug: str = "", tenant: str = "") -> dict:
+               agent_slug: str = "", tenant: str = "", direction: str = "inbound",
+               ownership: str = "local", remote_state: str = "") -> dict:
         rec = {
             "task_id": task_id,
             "context_id": context_id,
@@ -754,6 +789,9 @@ class TaskStore:
             "created_iso": now_iso(),
             "push_url": "",
             "push_config_id": "",
+            "direction": direction or "inbound",
+            "ownership": ownership or "local",
+            "remote_state": remote_state or "",
         }
         with self._lock:
             self._tasks[task_id] = rec
@@ -766,6 +804,8 @@ class TaskStore:
             rec = self._tasks.get(task_id)
             if rec and rec["state"] not in TERMINAL_STATES:
                 rec["state"] = state
+                if rec.get("direction") == "outbound":
+                    rec["remote_state"] = state
                 snapshot = dict(rec)
         if snapshot:
             self._persist(snapshot)

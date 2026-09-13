@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 120
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
 
+# Caller-side task records are opened lazily so merely discovering tools does not
+# create the profile's task database.
+def _task_store() -> protocol.TaskStore:
+    return protocol.TaskStore()
+
 
 # --------------------------------------------------------------------------
 # Peer resolution
@@ -304,6 +309,10 @@ def a2a_submit(args: dict, **_: Any) -> str:
     if not task_id:
         return f"Error: peer '{agent}' accepted the message but returned no task id."
 
+    _task_store().create(
+        task_id, reply_ctx, agent, direction="outbound", ownership="remote",
+        remote_state=state or protocol.STATE_SUBMITTED,
+    )
     protocol.persist_message(reply_ctx, "user", safe_message, task_id)
     protocol.metrics.outbound_total += 1
     return (
@@ -328,12 +337,18 @@ def a2a_get_task(args: dict, **_: Any) -> str:
     except Exception as e:
         return f"Error: GetTask on '{agent}' failed — {e}."
     if "error" in resp:
+        _task_store().complete(task_id, protocol.STATE_FAILED, _peer_rpc_error(resp, agent))
         return _peer_rpc_error(resp, agent)
     payload = resp.get("result", {})
     if not isinstance(payload, dict):
         return f"Error: unexpected GetTask response from '{agent}'."
     status = payload.get("status") or {}
-    state = _short_state(str(status.get("state", ""))) or "unknown"
+    raw_state = str(status.get("state", ""))
+    state = _short_state(raw_state) or "unknown"
+    if raw_state in protocol.TERMINAL_STATES:
+        _task_store().complete(task_id, raw_state, _reply_text_from_result(payload))
+    else:
+        _task_store().set_state(task_id, raw_state or protocol.STATE_WORKING)
     lines = [f"[{agent} · task {payload.get('id', task_id)} · {state}]"]
     msg = status.get("message")
     if msg:
@@ -509,11 +524,30 @@ def a2a_call(args: dict, **_: Any) -> str:
 
 
 def a2a_list(args: dict | None = None, **_: Any) -> str:
-    """List configured A2A peers and any persisted conversations."""
+    """List configured peers, conversations, metrics, and durable task records.
+
+    Task records are local snapshots. Remote state changes only when another A2A
+    operation explicitly queries the peer.
+    """
+    args = args or {}
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
+    kind = str(args.get("kind") or "all").lower()
+    state_filter = str(args.get("state") or "all").lower()
+    direction_filter = str(args.get("direction") or "all").lower()
+    peer_filter = str(args.get("peer") or "").strip()
+    try:
+        limit = max(1, min(int(args.get("limit") or 50), 100))
+    except (ValueError, TypeError):
+        limit = 50
+    if kind not in ("all", "peers", "conversations", "tasks"):
+        return "Error: 'kind' must be one of: all, peers, conversations, tasks."
+    if state_filter not in ("all", "working", "terminal"):
+        return "Error: 'state' must be one of: all, working, terminal."
+    if direction_filter not in ("all", "inbound", "outbound"):
+        return "Error: 'direction' must be one of: all, inbound, outbound."
     lines = []
-    if peers:
+    if kind in ("all", "peers") and peers:
         lines.append(f"Configured peers ({len(peers)}):")
         for name, entry in peers.items():
             auth = (entry.get("auth") or {}).get("type", "none")
@@ -523,12 +557,34 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
     else:
         lines.append("No peers configured. Add them under 'a2a_agents' in config.yaml.")
 
+    if kind == "peers":
+        return "\n".join(lines) if lines else "No peers configured. Add them under 'a2a_agents' in config.yaml."
+
     convos = protocol.list_conversations()
-    if convos:
+    if kind in ("all", "conversations") and convos:
         lines.append("")
         lines.append(f"Persisted conversations ({len(convos)}) — recall with a2a_history:")
         for c in convos[:25]:
             lines.append(f"  - {c}")
+
+    if kind in ("all", "tasks"):
+        records, _, _ = protocol.TaskStore().list(page_size=limit, with_total=True)
+        records = [r for r in records if not peer_filter or r.get("peer") == peer_filter]
+        if state_filter != "all":
+            records = [r for r in records if (r.get("state") in protocol.TERMINAL_STATES) == (state_filter == "terminal")]
+        if direction_filter != "all":
+            records = [r for r in records if r.get("direction") == direction_filter]
+        lines.append("")
+        lines.append(f"Tasks ({len(records)}):")
+        for r in records[:limit]:
+            state = str(r.get("state", "")).replace("TASK_STATE_", "").lower()
+            lines.append(f"  - {r.get('task_id')} context={r.get('context_id')} peer={r.get('peer')} "
+                         f"direction={r.get('direction', 'inbound')} ownership={r.get('ownership', 'local')} state={state}")
+        if not records:
+            lines.append("  (none)")
+
+    if kind == "tasks":
+        return "\n".join(lines) if lines else "No A2A tasks found."
 
     # Show metrics snapshot
     m = protocol.metrics.snapshot()
@@ -737,8 +793,18 @@ _SCHEMAS: dict[str, _ToolSchema] = {
         "type": "function",
         "function": {
             "name": "a2a_list",
-            "description": "List configured A2A peer agents, persisted A2A conversations, and metrics.",
-            "parameters": {"type": "object", "properties": {}},
+            "description": "List configured A2A peers, persisted conversations, durable tasks, and metrics. Filters are local and read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["all", "peers", "conversations", "tasks"]},
+                    "state": {"type": "string", "enum": ["all", "working", "terminal"]},
+                    "direction": {"type": "string", "enum": ["all", "inbound", "outbound"]},
+                    "peer": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "include_reply": {"type": "boolean"},
+                },
+            },
         },
     },
     "a2a_history": {

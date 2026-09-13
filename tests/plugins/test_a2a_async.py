@@ -211,16 +211,33 @@ class TestDurableTaskStore:
         assert rec["state"] == protocol.STATE_FAILED
         assert "restarted" in rec["reply"]
 
-    def test_wal_mode_and_schema(self, tmp_path):
+    def test_wal_mode_schema_version_and_task_metadata(self, tmp_path):
         db = str(tmp_path / "tasks.db")
         store = protocol.TaskStore(db_path=db)
-        store.create("t-x", "ctx-3", "peer")
+        store.create("t-x", "ctx-3", "peer", direction="outbound", ownership="remote")
         con = sqlite3.connect(db)
         mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+        version = con.execute("PRAGMA user_version").fetchone()[0]
         cols = {r[1] for r in con.execute("PRAGMA table_info(a2a_tasks)").fetchall()}
+        row = con.execute("SELECT direction, ownership FROM a2a_tasks WHERE task_id = 't-x'").fetchone()
         con.close()
         assert mode == "wal"
-        assert {"task_id", "context_id", "state", "reply"} <= cols
+        assert version == protocol.A2A_TASK_SCHEMA_VERSION
+        assert {"task_id", "context_id", "state", "reply", "direction", "ownership", "remote_state"} <= cols
+        assert row == ("outbound", "remote")
+
+    def test_outbound_nonterminal_tasks_survive_restart(self, tmp_path):
+        db = str(tmp_path / "tasks.db")
+        store1 = protocol.TaskStore(db_path=db)
+        store1.create("t-remote", "ctx-remote", "peer", direction="outbound", ownership="remote")
+        store1.set_state("t-remote", protocol.STATE_WORKING)
+
+        store2 = protocol.TaskStore(db_path=db)
+        rec = store2.get("t-remote")
+        assert rec is not None
+        assert rec["state"] == protocol.STATE_WORKING
+        assert rec["direction"] == "outbound"
+        assert rec["ownership"] == "remote"
 
     def test_trim_removes_from_db(self, tmp_path):
         db = str(tmp_path / "tasks.db")
