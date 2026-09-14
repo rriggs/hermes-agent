@@ -86,7 +86,7 @@ def _seed_profile_git_identity(profile_dir: Path, profile_name: str) -> None:
     os.chmod(gitconfig, 0o600)
     env_path = profile_dir / ".env"
     text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    text = re.sub(r"(?m)^GIT_CONFIG_GLOBAL=.*\\n?", "", text)
+    text = re.sub(r"(?m)^GIT_CONFIG_GLOBAL=.*\n?", "", text)
     if text and not text.endswith("\n"):
         text += "\n"
     text += f"\n# Profile-specific Git identity.\nGIT_CONFIG_GLOBAL={gitconfig}\n"
