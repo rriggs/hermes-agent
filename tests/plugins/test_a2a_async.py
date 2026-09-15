@@ -78,6 +78,17 @@ class TestReturnImmediatelyDetection:
             {"configuration": {"taskPushNotificationConfig": {}}}) is False
 
 
+class TestProfileResultClassification:
+    def test_handled_cli_failure_text_is_not_completed(self):
+        assert adapter_mod._failed_profile_reply(
+            "[agent did not reply in time]") is True
+        assert adapter_mod._failed_profile_reply(
+            "provider failed after retries") is True
+
+    def test_normal_reply_is_completed(self):
+        assert adapter_mod._failed_profile_reply("K_RD=3 K_WR=2") is False
+
+
 class TestAsyncAccept:
     def _dispatch_send(self, adapter, params):
         return adapter._rpc_message_send("req-1", params, "peer-alice")

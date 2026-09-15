@@ -74,6 +74,18 @@ def _reply_timeout() -> float:
         return 300.0
 
 
+def _failed_profile_reply(reply: str) -> bool:
+    """Recognize failure text emitted by a handled Hermes CLI request."""
+    normalized = " ".join((reply or "").split()).lower()
+    return any(marker in normalized for marker in (
+        "[agent did not reply in time]",
+        "[profile did not reply in time]",
+        "provider failed after retries",
+        "stream ended with no finish_reason",
+        "no visible answer was produced",
+    ))
+
+
 def _profile_scoped() -> bool:
     """True when running inside a multiplexed secondary profile's scope."""
     try:
@@ -951,7 +963,15 @@ class A2AAdapter(BasePlatformAdapter):
                 if session_id:
                     self._profile_sessions[key] = session_id
                     self._title_forward_session(profile, session_id, session_title)
-            return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
+            reply = security.redact_outbound((proc.stdout or "").strip())
+            # A successful CLI process only means that Hermes handled the
+            # request.  The agent can still have failed to produce a complete
+            # turn (for example after a provider timeout); those failures are
+            # deliberately rendered as text and may otherwise be mistaken for
+            # a successful A2A result.
+            if _failed_profile_reply(reply):
+                return reply, protocol.STATE_FAILED
+            return reply, protocol.STATE_COMPLETED
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
