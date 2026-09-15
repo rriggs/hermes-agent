@@ -1339,7 +1339,11 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(callback_url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(req, timeout=10) as resp:  # noqa: S310
                 if 200 <= resp.status < 300:
                     protocol.metrics.push_sent += 1
                     logger.debug("A2A: push notification sent for task %s", task_id)

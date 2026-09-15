@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import socket
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -183,18 +184,23 @@ def is_safe_callback_url(url: str, *, localhost_mode: Optional[bool] = None) -> 
     hostname = (parsed.hostname or "") if parsed and parsed.scheme in ("http", "https") else ""
     if not hostname:
         return False
-    hostname_lower = hostname.lower()
+    hostname_lower = hostname.lower().rstrip(".")
     if hostname_lower == "localhost":
         return localhost_mode
     for prefix in _BLOCKED_PREFIXES:
         if hostname_lower.startswith(prefix.lower()):
             return bool(localhost_mode and prefix in ("127.", "::1"))
     try:
-        ip = ipaddress.ip_address(hostname)
-        if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved:
-            return bool(localhost_mode and ip.is_loopback)
+        addresses = {ipaddress.ip_address(hostname)}
     except ValueError:
-        pass  # a hostname, not an IP
+        try:
+            addresses = {ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)}
+        except (OSError, ValueError):
+            return False
+    for ip in addresses:
+        if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved or ip.is_unspecified:
+            if not (localhost_mode and ip.is_loopback):
+                return False
     return True
 
 

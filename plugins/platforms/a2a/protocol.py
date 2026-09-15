@@ -1004,7 +1004,9 @@ def _conv_dir() -> Path:
 
 
 def _safe_name(context_id: str) -> str:
-    return "".join(c for c in (context_id or "default") if c.isalnum() or c in "-_") or "default"
+    raw = context_id or "default"
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)
+    return safe[:120] or "default"
 
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
