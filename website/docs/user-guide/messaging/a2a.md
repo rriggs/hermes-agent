@@ -47,6 +47,7 @@ With the `a2a` toolset enabled, the agent gets:
 |---|---|
 | `a2a_discover(url)` | Fetch and summarize a peer's Agent Card |
 | `a2a_call(agent, message, context_id?)` | Send a task, get the reply; multi-turn via `context_id` |
+| `a2a_steer(agent, message, context_id)` | Queue a non-blocking steering message on an existing context; returns a new task to poll |
 | `a2a_list()` | Configured peers, saved conversations, metrics |
 | `a2a_history(context_id)` | Recall a persisted A2A conversation |
 | `a2a_orchestrate(capability, message, mode?)` | Fan a task out to every peer advertising a capability (`all` / `first` / `best`) |
@@ -63,6 +64,27 @@ a2a_agents:
 ```
 
 Then just ask: *"Ask the researcher agent to summarize today's arXiv postings."* Direct URLs work too — `a2a_call` accepts any A2A endpoint.
+
+### Steering an asynchronous task
+
+Steering is an asynchronous `SendMessage` for an existing `context_id`. The
+future `a2a_steer` tool MUST:
+
+- require `agent`, `message`, and an existing `context_id`;
+- send `returnImmediately: true`, never block on the peer's model turn;
+- preserve the supplied context so the peer sees the prior conversation;
+- return the new steering task ID and context ID immediately;
+- allow the caller to use `a2a_get_task` to observe whether the steering turn
+  was queued, delivered, failed, or completed;
+- treat steering as queued continuation, not interruption. The peer may not see
+  it until the current model/tool turn reaches a safe boundary;
+- keep the original task ID and the steering task ID distinct for auditability;
+- reject or report a terminal/unknown context rather than pretending to revive
+  a completed task.
+
+Do not use synchronous `a2a_call` to steer a long-running task. A caller-side
+timeout does not prove that the steering message was delivered and can leave
+the original task running while the caller assumes the steer failed.
 
 ## Inbound: being callable
 
