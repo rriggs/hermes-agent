@@ -72,28 +72,6 @@ _PLACEHOLDER_ENV = (
 )
 
 
-def _profile_git_identity(profile_name: str) -> tuple[str, str]:
-    """Return the display name and Mobilinkd email for a named profile."""
-    display_name = profile_name.replace("-", " ").title()
-    return display_name, f"{profile_name}@mobilinkd.com"
-
-
-def _seed_profile_git_identity(profile_dir: Path, profile_name: str) -> None:
-    """Create the profile-local Git config and point its dotenv at it."""
-    display_name, email = _profile_git_identity(profile_name)
-    gitconfig = profile_dir / "gitconfig"
-    gitconfig.write_text(f"[user]\n\tname = {display_name}\n\temail = {email}\n", encoding="utf-8")
-    os.chmod(gitconfig, 0o600)
-    env_path = profile_dir / ".env"
-    text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    text = re.sub(r"(?m)^GIT_CONFIG_GLOBAL=.*\n?", "", text)
-    if text and not text.endswith("\n"):
-        text += "\n"
-    text += f"\n# Profile-specific Git identity.\nGIT_CONFIG_GLOBAL={gitconfig}\n"
-    env_path.write_text(text, encoding="utf-8")
-    os.chmod(env_path, 0o600)
-
-
 def _clone_all_copytree_ignore(source_dir: Path):
     """copytree ignore for --clone-all: history artifacts for any source, infrastructure
     only when the source is the default profile (see the two exclude sets above)."""
@@ -864,7 +842,6 @@ def create_profile(
     # had no file until first write and the profile silently inherited shell API keys —
     # read by users as "the new profile reads the root .env". Skipped when a clone copied one.
     _seed_file_if_missing(profile_dir / ".env", _PLACEHOLDER_ENV, 0o600)
-    _seed_profile_git_identity(profile_dir, canon)
 
     # Default SOUL.md to customize immediately (skipped when a clone already provided one).
     with contextlib.suppress(Exception):  # best-effort — don't fail profile creation over this
