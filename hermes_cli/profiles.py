@@ -82,13 +82,10 @@ def _seed_profile_git_identity(profile_dir: Path, profile_name: str) -> None:
     """Create the profile-local Git config and point its dotenv at it."""
     display_name, email = _profile_git_identity(profile_name)
     gitconfig = profile_dir / "gitconfig"
-    if not gitconfig.exists():
-        gitconfig.write_text(f"[user]\n\tname = {display_name}\n\temail = {email}\n", encoding="utf-8")
-        os.chmod(gitconfig, 0o600)
+    gitconfig.write_text(f"[user]\n\tname = {display_name}\n\temail = {email}\n", encoding="utf-8")
+    os.chmod(gitconfig, 0o600)
     env_path = profile_dir / ".env"
     text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    if "GIT_CONFIG_GLOBAL=" in text:
-        return
     text = re.sub(r"(?m)^GIT_CONFIG_GLOBAL=.*\n?", "", text)
     if text and not text.endswith("\n"):
         text += "\n"
