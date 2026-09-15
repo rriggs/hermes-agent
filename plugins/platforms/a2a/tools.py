@@ -257,6 +257,49 @@ def _peer_rpc_error(resp: dict, agent_label: str) -> str:
     return f"Error: peer '{agent_label}' returned {code}: {err.get('message', err)}"
 
 
+def a2a_steer(args: dict, **_: Any) -> str:
+    """Queue a non-blocking steering message on an existing A2A context."""
+    agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+    message = str(args.get("message") or args.get("text") or "").strip()
+    context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
+    if not agent or not message or not context_id:
+        return "Error: 'agent', 'message', and an existing 'context_id' are required."
+    peer = _resolve_peer(agent)
+    if not peer or not peer.get("url"):
+        return f"Error: unknown agent '{agent}'."
+    safe_message = security.redact_outbound(message)
+    params = {
+        "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=context_id),
+        "configuration": {"returnImmediately": True},
+    }
+    try:
+        resp = _rpc_request(peer, "SendMessage", params)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
+        return f"Error: steering '{agent}' failed — HTTP {e.code}."
+    except Exception as e:
+        return f"Error: steering '{agent}' failed — {e}."
+    if "error" in resp:
+        return _peer_rpc_error(resp, agent)
+    payload = protocol.unwrap_send_message_response(resp.get("result", {}))
+    if not isinstance(payload, dict):
+        return f"Error: peer '{agent}' returned a non-task response to steering."
+    status = payload.get("status") or {}
+    state = str(status.get("state", ""))
+    task_id = str(payload.get("id", ""))
+    reply_ctx = str(payload.get("contextId", context_id))
+    if not task_id:
+        return f"Error: peer '{agent}' accepted the steering message but returned no task id."
+    _task_store().create(task_id, reply_ctx, agent, direction="outbound", ownership="remote",
+                         remote_state=state or protocol.STATE_SUBMITTED)
+    protocol.persist_message(reply_ctx, "user", safe_message, task_id)
+    protocol.metrics.outbound_total += 1
+    return (f"[{agent} · steering task {task_id} · context {reply_ctx} · "
+            f"{_short_state(state) or 'submitted'}]\nSteering queued. Poll with "
+            f"a2a_get_task(agent='{agent}', task_id='{task_id}') to observe delivery.")
+
+
 def a2a_submit(args: dict, **_: Any) -> str:
     """Submit a task to a peer without blocking (SendMessage + returnImmediately).
 
@@ -852,6 +895,22 @@ _SCHEMAS: dict[str, _ToolSchema] = {
             },
         },
     },
+    "a2a_steer": {
+        "type": "function",
+        "function": {
+            "name": "a2a_steer",
+            "description": "Queue a non-blocking steering message on an existing A2A context. Returns a distinct task id to poll with a2a_get_task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "message": {"type": "string"},
+                    "context_id": {"type": "string"},
+                },
+                "required": ["agent", "message", "context_id"],
+            },
+        },
+    },
     "a2a_submit": {
         "type": "function",
         "function": {
@@ -948,6 +1007,7 @@ _HANDLERS = {
     "a2a_list": a2a_list,
     "a2a_history": a2a_history,
     "a2a_orchestrate": a2a_orchestrate,
+    "a2a_steer": a2a_steer,
     "a2a_submit": a2a_submit,
     "a2a_get_task": a2a_get_task,
     "a2a_await": a2a_await,

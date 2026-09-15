@@ -396,6 +396,19 @@ def _done_task(task_id="task-async-1", ctx="ctx-a", text="finished work"):
 
 
 class TestA2ASubmit:
+    def test_steer_queues_distinct_task_and_preserves_context(self, peer_server):
+        _PeerServer.responses.clear(); _PeerServer.seen.clear()
+        _PeerServer.responses["SendMessage"] = lambda p: _working_task("steer-1", "ctx-existing")
+        out = tools.a2a_steer({"agent": "peer", "message": "focus", "context_id": "ctx-existing"})
+        assert "steer-1" in out
+        method, params = _PeerServer.seen[0]
+        assert method == "SendMessage"
+        assert params["message"]["contextId"] == "ctx-existing"
+        assert params["configuration"]["returnImmediately"] is True
+
+    def test_steer_requires_existing_context(self, peer_server):
+        assert "context_id" in tools.a2a_steer({"agent": "peer", "message": "focus"})
+
     def test_submit_returns_task_id(self, peer_server):
         _PeerServer.responses.clear(); _PeerServer.seen.clear()
         _PeerServer.responses["SendMessage"] = lambda p: _working_task()
