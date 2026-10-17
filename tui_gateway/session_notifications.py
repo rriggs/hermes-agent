@@ -101,7 +101,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     # requiring a current client prevents it from spending a full model turn unseen.
     # Shared peer membership excludes stdio, even when it is the real TUI RPC channel
     # (possibly wrapped for a dashboard sidecar), rather than a headless fallback sink.
-    if (evt.get("type") == "async_delegation" and evt.get("startup_replay")
+    if (evt.get("type") in {"async_delegation", "plugin_completion"} and evt.get("startup_replay")
             and not (_session_has_live_transport(session)
                      or (_stdio_is_rpc_channel and session.get("transport") is _stdio_transport))):
         return False
@@ -139,6 +139,9 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             task_idx = ((evt.get("results") or [{}])[0] or {}).get("task_index", "")
             return (evt.get("delegation_id", ""), evt_type, "task_failure", task_idx)
         return (evt.get("delegation_id", ""), evt_type)
+    if evt_type == "plugin_completion":
+        # One plugin can publish many results into one session; key each by its own identity.
+        return (evt.get("completion_id") or evt.get("event_id", ""), evt_type)
     extra = _DEDUP_EXTRA_FIELDS.get("watch_overflow_" if evt_type.startswith("watch_overflow_") else evt_type, ())
     return (evt.get("session_id", ""), evt_type, *(evt.get(f, 0 if f == "suppressed" else "") for f in extra))
 
@@ -495,9 +498,12 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
 
 
 def _notif_defer_event(evt, claim, put=None):
-    from tools.async_delegation import defer_completion_delivery
     from tools.process_registry import process_registry
-    if claim:
+    if claim and evt.get("type") == "plugin_completion":
+        from agent.plugin_completions import defer_plugin_completion
+        defer_plugin_completion(str(evt.get("completion_id") or ""), claim)
+    elif claim:
+        from tools.async_delegation import defer_completion_delivery
         defer_completion_delivery(evt['delegation_id'], claim)
     (put or process_registry.completion_queue.put)(evt)
 
@@ -573,7 +579,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             (logger.warning if is_delegation and not restored else logger.debug)(
                 "Dropping unowned %s notification (origin=%r key=%r) instead of delivering to session %s",
                 evt_type, origin, key, sid)
-            if is_delegation:
+            if is_delegation or evt_type == "plugin_completion":
                 from tools.async_delegation import return_completion_offer
                 return_completion_offer(evt)
         elif is_delegation:

@@ -159,6 +159,57 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     return metadata
 
 
+def _drain_gateway_watch_events(completion_queue) -> list[dict]:
+    """Drain gateway-owned watch events without spinning on requeued events.
+    Foreign events requeued inside ``while not queue.empty()`` never terminate: detach, then requeue.
+
+    Lives beside the notification drain that is its only caller, not in the ``gateway.run`` facade.
+    """
+    watch_events: list[dict] = []
+    requeue: list[dict] = []
+    while not completion_queue.empty():
+        try:
+            evt = completion_queue.get_nowait()
+        except Exception:
+            break
+        evt_type = evt.get("type", "completion")
+        if evt_type in {
+            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
+            "heartbeat"}:
+            watch_events.append(evt)
+        elif evt_type == "plugin_completion":
+            # A plugin completion is addressed to the session that captured the target: a messaging
+            # route (platform/chat) is this gateway's to deliver, while a local CLI/TUI session's
+            # event is drained by that surface in its own process. Requeue the local one rather than
+            # dropping it from this drain.
+            (watch_events if str(evt.get("platform") or "") else requeue).append(evt)
+        elif evt_type == "async_delegation":
+            requeue.append(evt)
+        # else: process completion events are handled by the watcher task
+    for evt in requeue:
+        completion_queue.put(evt)
+    return watch_events
+
+
+def _plugin_completion_claim(evt: dict, consumer: str) -> Optional[str]:
+    """Claim a durable plugin completion before injecting it; None when another consumer owns it."""
+    from tools.async_delegation import claim_event_delivery
+    return claim_event_delivery(evt, consumer)
+
+
+def _settle_plugin_completion(evt: dict, claim: Optional[str], operation: str) -> None:
+    """Settle a claimed plugin completion: ``complete`` (injected or intentionally suppressed),
+    ``defer`` (surface refused; retry later without spending an attempt) or ``release`` (no route:
+    the row stays pending for the stale sweep, bounded by its attempt budget)."""
+    if not claim:
+        return
+    completion_id = str(evt.get("completion_id") or "")
+    if not completion_id:
+        return
+    from agent import plugin_completions
+    getattr(plugin_completions, f"{operation}_plugin_completion")(completion_id, claim)
+
+
 class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
@@ -707,14 +758,22 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
 
         See #9290.
         """
-        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
+        from gateway.run import _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
         for evt in watch_events:
+            # A plugin completion is a durable row, not an in-memory notice: claim it before
+            # injecting so no other drain delivers the same event, and settle the claim by outcome.
+            is_plugin = evt.get("type") == "plugin_completion"
+            claim = _plugin_completion_claim(evt, f"gateway-watch:{id(self)}") if is_plugin else None
+            if is_plugin and claim is None:
+                continue  # another consumer owns this row; its copy is the one to deliver
+            delivered = None
             async with self._completion_event_scope(evt):
                 from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
-                    continue
-                if self._load_background_notifications_mode() == "off":
+                if not should_surface_notification(evt) or self._load_background_notifications_mode() == "off":
+                    # Drained, claimed and acknowledged like any completion -- only the turn-starting
+                    # injection is suppressed, so the durable row must not stay pending.
+                    _settle_plugin_completion(evt, claim, "complete")
                     continue
                 if evt.get("type") == "heartbeat":
                     from gateway.session_automation import deliver_heartbeat
@@ -722,6 +781,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 else:
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
+                        _settle_plugin_completion(evt, claim, "release")
                         continue
                     try:
                         delivered = await self._inject_watch_notification(synth_text, evt)
@@ -730,7 +790,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         delivered = False
             # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
+                if is_plugin:
+                    # The surface refused a retryable delivery: keep the row pending for a later
+                    # route without spending an attempt, and let the sweep re-offer it.
+                    _settle_plugin_completion(evt, claim, "defer")
                 completion_queue.put(evt)
+            elif is_plugin:
+                # No route is not a delivery: hand the row back as pending (bounded by its attempt
+                # budget) rather than acking a completion no session ever received.
+                _settle_plugin_completion(evt, claim, "release" if delivered is None else "complete")
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
@@ -1497,7 +1565,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         owners that were already gone when the gateway started."""
         from tools.async_delegation import sweep_orphaned_completions
         from tools.process_registry import process_registry as _pr
-        sweep = lambda: sweep_orphaned_completions(_pr.completion_queue)
+
+        def sweep() -> int:
+            # Plugin completions (agent/plugin_completions.py) share the ledger discipline: a claim
+            # whose consumer died mid-injection is re-offered once its lease expires.
+            from agent.plugin_completions import sweep_stale_plugin_completions
+            return (sweep_orphaned_completions(_pr.completion_queue)
+                    + sweep_stale_plugin_completions(_pr.completion_queue))
+
         with _log_suppressed(logging.DEBUG, "Orphaned async completion sweep failed: %s"):
             if count := sweep():
                 logger.info("Re-offered %d orphaned async completion(s)", count)

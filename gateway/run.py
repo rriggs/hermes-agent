@@ -3045,34 +3045,11 @@ def _format_gateway_process_notification(evt: dict) -> str | None:
         text += "]"
         return text
 
-    if evt_type in ("async_delegation", "heartbeat"):
+    if evt_type in ("async_delegation", "heartbeat", "plugin_completion"):
         from tools.process_registry_notifications import format_process_notification
         return format_process_notification(evt)
 
     return None
-
-
-def _drain_gateway_watch_events(completion_queue) -> list[dict]:
-    """Drain gateway-owned watch events without spinning on requeued events.
-    Foreign events requeued inside ``while not queue.empty()`` never terminate: detach, then requeue."""
-    watch_events: list[dict] = []
-    requeue: list[dict] = []
-    while not completion_queue.empty():
-        try:
-            evt = completion_queue.get_nowait()
-        except Exception:
-            break
-        evt_type = evt.get("type", "completion")
-        if evt_type in {
-            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
-            "heartbeat"}:
-            watch_events.append(evt)
-        elif evt_type == "async_delegation":
-            requeue.append(evt)
-        # else: process completion events are handled by the watcher task
-    for evt in requeue:
-        completion_queue.put(evt)
-    return watch_events
 
 
 # Weak ref to the active GatewayRunner; tools like send_message route through its live adapters.
