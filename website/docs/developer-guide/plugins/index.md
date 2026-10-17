@@ -838,6 +838,59 @@ Config and state have different owners: settings are user-visible behavior in
 `config.yaml`, while state is plugin-owned runtime data under
 `<HERMES_HOME>/plugin-data/`. Neither API exposes another plugin's namespace.
 
+### Deliver a background result into the session that started it
+
+A tool call ends with the turn, but the work it starts may not. To report a
+result later you need a delivery target captured **during** the tool call — the
+session and its route are only known then:
+
+```python
+def register(ctx):
+    def watch(args, session_id=None):
+        # Capture while the invoking session is bound. Persist this mapping in your
+        # own store: it stays valid across a Hermes restart.
+        target = ctx.capture_completion_target(session_id=session_id)
+        ctx.state.set("watch_target", target)
+        start_remote_watch(args["task_id"])
+        return json.dumps({"watching": args["task_id"]})
+
+    def on_remote_done(task_id, text):
+        receipt = ctx.publish_completion(
+            target=ctx.state.get("watch_target"),
+            event_id=f"{task_id}:completed",   # idempotency key
+            content=text,
+            metadata={"task_id": task_id, "state": "completed"},
+        )
+        logger.info("completion %s is %s", receipt["completion_id"], receipt["delivery_state"])
+```
+
+`publish_completion()` persists the event and queues it for the target session's
+next idle turn — it never interrupts a turn in progress — and returns a receipt.
+Read the receipt carefully: `status: "queued"` means the event was accepted, not
+that the session ran on it or that a user-facing reply went out. Re-publishing
+the same `event_id` for the same session returns `status: "duplicate"` and
+queues nothing, so a watcher that re-observes a terminal state after a restart
+cannot notify twice.
+
+Guarantees and limits:
+
+- **Profile-scoped and owned.** A target binds to the plugin that captured it;
+  publishing against another plugin's target, an unknown target or an expired
+  one raises. A plugin cannot address an arbitrary session.
+- **Durable.** Pending events survive a restart and replay through the same
+  policy; each delivery is claimed and acknowledged by exactly one consumer
+  (CLI, TUI, or the messaging gateway), and retried when delivery is refused.
+- **Not everywhere.** `capture_completion_target()` raises
+  `CompletionDeliveryUnsupported` on a surface that can never receive a later
+  turn (one-shot `hermes -q`/`-z`, cron, Kanban or managed workers, stateless
+  API sessions). Poll synchronously there instead of persisting a dead watch.
+- **Bounded.** `content` is capped at 32,000 characters and `metadata` at 8 KiB;
+  content passes through the sensitive-value redactor before it is stored.
+
+This is the supported path. Do not import Hermes' completion queues or write to
+`state.db` yourself — those are internals, and bypassing them skips ownership,
+deduplication, and delivery policy.
+
 ### Settings form in the Desktop
 
 Every key you declare in the manifest's `config_schema` renders as a row on the

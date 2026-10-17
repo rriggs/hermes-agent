@@ -108,6 +108,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=... \| origin=...)` - see [Injecting Messages](#injecting-messages) |
+| Deliver a background result later | `ctx.capture_completion_target()` then `ctx.publish_completion(...)` - see [Delivering a Completion](#delivering-a-completion) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -1013,6 +1014,50 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 :::note
 This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
 :::
+
+## Delivering a Completion
+
+A plugin that starts long-running work needs to report the result after the tool call
+and the turn are over. `ctx.inject_message()` cannot do that: it needs a live host and
+a known session route at call time. Use the completion publisher instead.
+
+Capture a target while the tool call is running, persist it, and publish when the work
+finishes:
+
+```python
+def register(ctx):
+    def watch(args, session_id=None):
+        ctx.state.set("target", ctx.capture_completion_target(session_id=session_id))
+        start_remote_watch(args["task_id"])
+        return json.dumps({"watching": args["task_id"]})
+
+    def on_done(task_id, text):
+        return ctx.publish_completion(
+            target=ctx.state.get("target"),
+            event_id=f"{task_id}:completed",
+            content=text,
+            metadata={"task_id": task_id, "state": "completed"},
+        )
+```
+
+The event is written to the profile's `state.db` and delivered to the target session as a
+new turn at its next idle boundary, on whichever surface owns it (classic CLI, TUI/Desktop,
+or the messaging gateway). It never interrupts a running turn.
+
+- `publish_completion()` returns a receipt. `status: "queued"` is queue admission, not
+  delivery: it does not mean the model acted on the content or that a reply was sent.
+- `event_id` is an idempotency key. Publishing it again for the same session returns
+  `status: "duplicate"` and queues nothing, so a watcher that re-observes a terminal state
+  after a restart cannot notify twice.
+- Pending events survive a restart and replay; each one is claimed and acknowledged by
+  exactly one consumer and retried when delivery is refused.
+- `capture_completion_target()` raises `CompletionDeliveryUnsupported` where no later turn
+  can reach the session (one-shot `hermes -q`/`-z`, cron, Kanban or managed workers,
+  stateless API sessions). Poll synchronously on those surfaces.
+- The target is bound to the plugin that captured it; publishing against another plugin's
+  target, an unknown target, or an expired one raises.
+
+Full example and limits: [Build a Plugin § Deliver a background result into the session that started it](../../developer-guide/plugins/index.md#deliver-a-background-result-into-the-session-that-started-it).
 
 ## Plugin code inside the gateway
 
