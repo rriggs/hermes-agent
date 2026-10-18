@@ -218,6 +218,28 @@ def test_a_sweep_never_clears_a_claim_that_changed_after_its_selection(bound_ses
     assert claim == "live", "the sweep must not erase a claim another consumer just took"
 
 
+def test_a_row_whose_fence_lost_is_not_reoffered_or_dropped(bound_session, monkeypatch):
+    """A failed claim-clear means another consumer owns the row: leave every column alone."""
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    pc.publish_completion("a2a", target=target, event_id="task-4:done", content="x")
+    row = pc._existing_completion("a2a", SESSION_ID, "task-4:done")
+    old = pc.time.time() - 49 * 3600
+    with pc._DB_LOCK, pc._transaction() as conn:
+        conn.execute(
+            "UPDATE plugin_completions SET delivery_claim='live', delivery_claimed_at=0, "
+            "created_at=? WHERE completion_id=?", (old, row["completion_id"]))
+
+    monkeypatch.setattr(pc, "_clear_stale_claim", lambda *args: False)
+    from queue import Queue
+
+    assert pc.sweep_stale_plugin_completions(Queue(), now=pc.time.time()) == 0
+    with pc._DB_LOCK, pc._transaction() as conn:
+        state, claim = conn.execute(
+            "SELECT delivery_state, delivery_claim FROM plugin_completions WHERE completion_id=?",
+            (row["completion_id"],)).fetchone()
+    assert (state, claim) == ("pending", "live"), "the sweep touched a row it lost the fence on"
+
+
 def test_returning_an_offer_writes_the_owners_ledger_not_the_callers(tmp_path, bound_session):
     """The queue is process-wide, the ledger is per profile: return under the owner's scope."""
     owner_home = tmp_path / "owner"

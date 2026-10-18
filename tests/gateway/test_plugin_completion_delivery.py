@@ -345,6 +345,32 @@ async def test_a_failed_claim_returns_the_event_and_does_not_lose_the_batch(
     assert pc.sweep_stale_plugin_completions(queue.Queue(), now=time.time() + 120.0) == 1
 
 
+@pytest.mark.asyncio
+async def test_a_failing_recovery_write_keeps_the_copy_on_the_queue(
+    monkeypatch, tmp_path, bound_session,
+):
+    """If the ledger is still failing, the event must not vanish: no claim, no marker, no copy."""
+    runner = _build_runner(monkeypatch, tmp_path)
+    events = queue.Queue()
+    first = _published_event(bound_session)
+    events.put(first)
+
+    import gateway.run_notifications as rn
+
+    def flaky_claim(evt, consumer):
+        raise RuntimeError("sqlite busy")
+
+    def failing_return(evt):
+        raise RuntimeError("sqlite still busy")
+
+    monkeypatch.setattr(rn, "_plugin_completion_claim", flaky_claim)
+    monkeypatch.setattr("agent.plugin_completions.return_plugin_completion_offer", failing_return)
+
+    await runner._drain_watch_notifications(events)
+
+    assert events.qsize() == 1, "the drained event must go back when its row cannot be marked"
+
+
 def test_a_dropped_completion_keeps_its_key_but_not_its_payload(bound_session, monkeypatch):
     target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
     pc.publish_completion(PLUGIN, target=target, event_id="task-5:done", content="x" * 30_000)

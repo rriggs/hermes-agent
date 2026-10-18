@@ -793,13 +793,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     # every event from the queue, so the failing one has to go back and its row
                     # has to stay eligible for the sweep. Siblings are handled by this loop.
                     logger.exception("Plugin completion claim failed; returning the event")
+                    returned = False
                     if is_plugin:
                         from agent.plugin_completions import return_plugin_completion_offer
-                        # Deferred and returned, NOT requeued: the sweep re-offers it after the
-                        # stale window, and requeueing here would put two copies on the queue.
-                        # Bound to the event's own profile: this process serves many profiles.
-                        return_plugin_completion_offer(evt)
-                    else:
+                        try:
+                            # Deferred and returned, NOT requeued: the sweep re-offers it after the
+                            # stale window, and requeueing here would put two copies on the queue.
+                            # Bound to the event's own profile: this process serves many profiles.
+                            return_plugin_completion_offer(evt)
+                            returned = True
+                        except Exception:
+                            # The ledger is still failing: keep the copy rather than strand the
+                            # completion with no claim and no deferred marker.
+                            logger.exception("Could not mark the completion deferred; keeping its copy")
+                    if not returned:
                         completion_queue.put(evt)
                     continue
                 if is_plugin and claim is None:

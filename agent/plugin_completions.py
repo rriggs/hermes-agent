@@ -494,8 +494,17 @@ def sweep_stale_plugin_completions(target_queue, *, now: Optional[float] = None)
                        OR (delivery_deferred_at IS NOT NULL AND delivery_deferred_at < ?))
                 ORDER BY created_at, completion_id""",
             (cutoff, now - _SWEEP_STALE_S)).fetchall()
-        abandoned = {row[0] for row in rows if row[3] and _clear_stale_claim(conn, row[0], row[4])}
-        return _offer_rows(conn, rows, target_queue, now, force=abandoned)
+        offerable: list = []
+        abandoned: set[str] = set()
+        for row in rows:
+            if row[3]:  # had a claim when this sweep selected it
+                # A failed fence means another consumer re-claimed the row after selection: it is
+                # NOT ours to re-offer, and it must not reach the replay/drop path either.
+                if not _clear_stale_claim(conn, row[0], row[4]):
+                    continue
+                abandoned.add(row[0])
+            offerable.append(row)
+        return _offer_rows(conn, offerable, target_queue, now, force=abandoned)
 
 
 def _clear_stale_claim(conn: sqlite3.Connection, completion_id: str, claim: Any) -> bool:
