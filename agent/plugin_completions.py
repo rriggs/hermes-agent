@@ -69,6 +69,10 @@ _CLAIM_LEASE_S = 300.0
 # Pending completions older than this are dropped on replay instead of starting a turn nobody waits on.
 _MAX_REPLAY_AGE_S = 48 * 3600.0
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+# A delivered completion is the dedup tombstone for its event id, so it must outlive the target it
+# was published against: republishing after the row was pruned would queue a fresh notification,
+# contradicting "a delivered event is never re-notified".
+_DELIVERED_RETENTION_SECONDS = _RETENTION_SECONDS + 30 * 24 * 60 * 60
 # How long a captured target stays publishable. A plugin may legitimately hold a target across
 # hours of background work, so the default is generous; it is a real, enforced expiry (publish
 # raises ``CompletionTargetError`` after it) rather than a pruning accident.
@@ -808,8 +812,9 @@ def _prune() -> None:
     with _DB_LOCK, _transaction() as conn:
         if not _table_exists(conn):
             return
-        conn.execute("DELETE FROM plugin_completions WHERE delivery_state='delivered' AND updated_at<?",
-                     (cutoff,))
+        conn.execute(
+            "DELETE FROM plugin_completions WHERE delivery_state='delivered' AND updated_at<?",
+            (time.time() - _DELIVERED_RETENTION_SECONDS,))
         # Prune targets by their own expiry, never by capture age: a target captured for a long
         # background watch is still live at day 7. Legacy rows (expires_at IS NULL) have no
         # declared expiry, so they are only aged out once nothing pending references them --

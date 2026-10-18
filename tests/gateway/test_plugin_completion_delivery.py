@@ -258,6 +258,24 @@ def test_a_stale_claim_is_reoffered_without_a_restart(bound_session):
     assert _row()["delivery_state"] == "pending"
 
 
+def test_a_delivered_event_stays_a_duplicate_while_its_target_is_publishable(
+        bound_session, monkeypatch):
+    """Dedup rows are the "never re-notify" contract: they must outlive the target."""
+    target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
+    pc.publish_completion(PLUGIN, target=target, event_id="task-9:done", content="done")
+    row = _row("task-9:done")
+    assert pc.claim_plugin_completion(row["completion_id"], "test:consumer") is True
+    assert pc.complete_plugin_completion(row["completion_id"], "test:consumer") is True
+
+    real = time.time()
+    monkeypatch.setattr(pc, "time", SimpleNamespace(time=lambda: real + 8 * 86400))
+    pc._prune()
+
+    again = pc.publish_completion(PLUGIN, target=target, event_id="task-9:done", content="done")
+    assert again["status"] == "duplicate", (
+        "the dedup tombstone was pruned while the target could still publish")
+
+
 def test_a_target_is_publishable_for_thirty_days_and_pruned_by_expiry(bound_session, monkeypatch):
     target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
     assert target.expires_at is not None

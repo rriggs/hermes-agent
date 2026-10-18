@@ -514,6 +514,9 @@ def _notif_defer_event(evt, claim, put=None):
     if claim and evt.get("type") == "plugin_completion":
         from agent.plugin_completions import defer_plugin_completion
         defer_plugin_completion(str(evt.get("completion_id") or ""), claim)
+        # Deferred means "the sweep re-offers this row". Requeueing this copy as well would put
+        # two live copies of one event on the queue (the sweep adds one after the stale window).
+        return
     elif claim:
         from tools.async_delegation import defer_completion_delivery
         defer_completion_delivery(evt['delegation_id'], claim)
@@ -576,6 +579,13 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     queue = registry.completion_queue
     evt_type, is_delegation = evt.get("type", "completion"), evt.get("type") == "async_delegation"
     if not owned and _notification_event_belongs_elsewhere(sid, session, evt):
+        if evt_type == "plugin_completion" and deferred is not None:
+            # A plugin completion is a durable row, not a queue-owned notice. During a shutdown
+            # drain, mark it deferred so the sweep can re-offer it; appending it to a list that
+            # may be dropped would strand the row with no recovery path.
+            from tools.async_delegation import return_completion_offer
+            return_completion_offer(evt)
+            return True
         if deferred is not None:
             deferred.append(evt)
         else:  # otherwise a process started in session A surfaces in whichever poller wakes first
@@ -597,7 +607,12 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         elif is_delegation:
             deferred.append(evt)
         else:
-            logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
+            # Plugin completions are durable: hand the row back to the sweep instead of dropping
+            # the only copy (they are never appended to a shutdown deferred list).
+            from tools.async_delegation import return_completion_offer
+            logger.debug("Returning unowned %s notification during shutdown drain (origin=%r key=%r)",
+                         evt_type, origin, key)
+            return_completion_offer(evt)
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True

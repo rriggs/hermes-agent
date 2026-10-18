@@ -70,6 +70,19 @@ def test_off_acknowledges_the_durable_row_and_starts_no_turn(bound, monkeypatch)
         "a suppressed completion left pending replays later and delivers anyway")
 
 
+def test_a_deferred_plugin_completion_is_not_also_requeued(bound, monkeypatch):
+    """Deferred means the sweep re-offers the row; a requeued copy would duplicate it."""
+    calls: list = []
+    monkeypatch.setattr(pc, "defer_plugin_completion", lambda *a: calls.append(a) or True)
+    requeued: list = []
+    evt = {"type": "plugin_completion", "completion_id": "pcp_x", "session_key": SESSION_KEY}
+
+    server._notif_defer_event(evt, "tui:x", put=requeued.append)
+
+    assert calls == [("pcp_x", "tui:x")]
+    assert requeued == [], "the copy must not be requeued as well"
+
+
 def test_the_recovery_hook_sweeps_the_plugin_ledger(bound, monkeypatch):
     calls: list = []
     monkeypatch.setattr(pc, "sweep_stale_plugin_completions",
