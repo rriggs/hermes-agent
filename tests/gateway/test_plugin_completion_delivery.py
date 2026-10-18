@@ -345,10 +345,23 @@ def test_a_deferred_row_is_reoffered_once_and_stops(bound_session):
     assert events.qsize() == 1
 
 
-def test_an_abandoned_claim_is_reoffered_even_with_the_offer_marker_set(bound_session):
+def test_an_abandoned_claim_is_reoffered_once_even_with_the_offer_marker_set(bound_session):
     events = queue.Queue()
     evt = _published_event(bound_session)
     assert pc.claim_plugin_completion(evt["completion_id"], "dead:consumer") is True
 
     assert pc.sweep_stale_plugin_completions(events, now=time.time() + 400.0) == 1
+    assert events.qsize() == 1
+    # The re-offer cleared the dead claim: later sweeps must not add more copies of one event.
+    assert pc.sweep_stale_plugin_completions(events, now=time.time() + 410.0) == 0
+    assert events.qsize() == 1
+
+
+def test_a_discarded_startup_offer_is_eligible_for_the_sweep(bound_session):
+    """A TUI that cannot prove ownership drops the copy; the row must still be recoverable."""
+    events = queue.Queue()
+    evt = _published_event(bound_session)
+    pc.return_plugin_completion_offer(evt)  # the queue copy was discarded
+
+    assert pc.sweep_stale_plugin_completions(events, now=time.time() + 120.0) == 1
     assert events.qsize() == 1

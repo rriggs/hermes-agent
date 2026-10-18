@@ -401,10 +401,33 @@ def drop_plugin_completion(completion_id: str, claim_id: str) -> bool:
 
 
 def return_plugin_completion_offer(evt: Mapping[str, Any]) -> None:
-    """Hand a queued copy back after a consumer discarded it with the row still pending."""
+    """Hand a queued copy back after a consumer discarded it with the row still pending.
+
+    Clearing the process-local offer is not enough: the sweep only selects abandoned claims and
+    rows marked deferred, so a discarded startup copy would otherwise wait for another restart.
+    Mark the row deferred so the next sweep re-offers it.
+    """
     completion_id = str((evt or {}).get("completion_id") or "")
-    if completion_id:
-        _forget_offer(completion_id)
+    if not completion_id:
+        return
+    _forget_offer(completion_id)
+    mark_offer_returned(completion_id)
+
+
+def mark_offer_returned(completion_id: str, *, now: Optional[float] = None) -> bool:
+    """Make a pending row eligible for the sweep after its queued copy was discarded."""
+    if not completion_id:
+        return False
+    now = time.time() if now is None else now
+    with _DB_LOCK, _transaction() as conn:
+        if not _table_exists(conn):
+            return False
+        cur = conn.execute(
+            """UPDATE plugin_completions
+                  SET delivery_deferred_at=COALESCE(delivery_deferred_at, ?), updated_at=?
+                WHERE completion_id=? AND delivery_state='pending'""",
+            (now, now, completion_id))
+        return cur.rowcount == 1
 
 
 # ── replay / sweep ──────────────────────────────────────────────────────────
@@ -455,6 +478,14 @@ def sweep_stale_plugin_completions(target_queue, *, now: Optional[float] = None)
                 ORDER BY created_at, completion_id""",
             (cutoff, now - _SWEEP_STALE_S)).fetchall()
         abandoned = {row[0] for row in rows if row[3]}
+        for completion_id in abandoned:
+            # The claim belongs to a consumer that died; clearing it means the re-offered copy is
+            # the only live one. Without this every sweep re-offers the same row again.
+            conn.execute(
+                """UPDATE plugin_completions
+                      SET delivery_claim=NULL, delivery_claimed_at=NULL
+                    WHERE completion_id=? AND delivery_state='pending'""",
+                (completion_id,))
         return _offer_rows(conn, rows, target_queue, now, force=abandoned)
 
 
