@@ -635,6 +635,9 @@ _SELECT_TARGET = (
     "SELECT " + ", ".join(_TARGET_COLUMNS) + " FROM plugin_completion_targets WHERE target_id=?")
 
 
+_dedup_ready: set[str] = set()
+
+
 def _connect() -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
     from hermes_constants import mkdir_under_hermes_home as _mkdir
@@ -646,6 +649,20 @@ def _connect() -> sqlite3.Connection:
     _secure_state_db_files(path, create_main=True)
     conn = open_db(path, db_label="state.db (plugin completions)", busy_timeout_ms=10_000,
                    wal=False, row_factory=None, initialize=reconcile_state_schema)
+    # The dedup index names a reconciled column, so it cannot live in SCHEMA_SQL. Reconciling
+    # callers create it; an already-open database (or a path that skipped the initializer) may not
+    # have it, and without the constraint a re-publish inserts a second row. One attempt per path
+    # per process, because a database that predates the index may already contain duplicates.
+    key = str(path)
+    if key not in _dedup_ready:
+        _dedup_ready.add(key)
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_completions_dedup "
+                "ON plugin_completions(plugin_id, conversation_id, event_id)")
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            logger.warning("Plugin completion dedup index unavailable in %s: %s", path, exc)
     _secure_state_db_files(path)
     return conn
 

@@ -33,6 +33,22 @@ class PluginSessionDeliveryMixin:
         from hermes_cli.plugins_injection import inject_plugin_message
         return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
 
+    def queue_context_note(self, text: str, *, key: str = "") -> bool:
+        """Queue a model-visible note for the current session without starting a turn.
+
+        Rides the session's next tool result or user turn (``agent/plugin_live_notes.py``), so the
+        model sees it and the cached prefix is untouched. Returns False when no live agent is
+        reachable from this process (the caller may surface the same text in a tool result).
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False
+        agent = getattr(getattr(self._manager, "_cli_ref", None), "agent", None)
+        if agent is None:
+            return False
+        from agent.plugin_live_notes import queue_plugin_notice
+        queue_plugin_notice(agent, key or self.plugin_id, text.strip())
+        return True
+
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""
         from hermes_cli.plugin_session import context_cwd
