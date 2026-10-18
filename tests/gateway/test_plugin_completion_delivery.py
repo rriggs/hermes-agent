@@ -97,7 +97,7 @@ def _published_event(bound_session) -> dict:
 
 
 def _row(event_id: str = "task-7:completed") -> dict:
-    row = pc._existing_completion(PLUGIN, SESSION_KEY, event_id)
+    row = pc._existing_completion(PLUGIN, SESSION_ID, event_id)
     assert row is not None, "the completion ledger row must exist"
     return row
 
@@ -289,3 +289,66 @@ def test_a_target_is_publishable_for_thirty_days_and_pruned_by_expiry(bound_sess
     at(38 * 86400)
     pc._prune()
     assert target_rows() == 0, "an expired target outlived its declared expiry"
+
+def test_a_new_conversation_is_not_a_duplicate(monkeypatch, tmp_path):
+    """/new keeps the chat's session_key; the completion must still reach the new conversation."""
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  background_process_notifications: concise\n", encoding="utf-8")
+    import gateway.run as gateway_run
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    def publish_in(session_id: str, content: str) -> dict:
+        tokens = set_session_vars(
+            platform="telegram", source="telegram", chat_id="42", chat_type="dm",
+            session_key=SESSION_KEY, session_id=session_id)
+        try:
+            target = pc.capture_completion_target(PLUGIN, session_id=session_id)
+            return pc.publish_completion(
+                PLUGIN, target=target, event_id="task-7:completed", content=content)
+        finally:
+            clear_session_vars(tokens)
+
+    first = publish_in("sess-A", "finished in A")
+    second = publish_in("sess-B", "finished in B")
+
+    assert first["status"] == "queued"
+    assert second["status"] == "queued", (
+        "a publish into a different conversation was reported as a duplicate and dropped")
+    # ... while a real duplicate in the SAME conversation still deduplicates.
+    again = publish_in("sess-B", "finished in B twice")
+    assert again["status"] == "duplicate"
+    assert again["completion_id"] == second["completion_id"]
+
+
+def test_the_sweep_does_not_multiply_a_live_unclaimed_offer(bound_session):
+    """A copy that is still queued must not be duplicated by every sweep pass."""
+    events = queue.Queue()
+    events.put(_published_event(bound_session))  # the live, never-claimed copy
+
+    for _ in range(3):
+        assert pc.sweep_stale_plugin_completions(events, now=time.time() + 120.0) == 0
+
+    assert events.qsize() == 1
+    assert _row()["delivery_state"] == "pending"
+
+
+def test_a_deferred_row_is_reoffered_once_and_stops(bound_session):
+    events = queue.Queue()
+    evt = _published_event(bound_session)
+    assert pc.claim_plugin_completion(evt["completion_id"], "refusing:consumer") is True
+    assert pc.defer_plugin_completion(evt["completion_id"], "refusing:consumer") is True
+
+    assert pc.sweep_stale_plugin_completions(events, now=time.time() + 120.0) == 1
+    assert events.qsize() == 1
+    # The re-offer clears the deferred marker, so the next sweep adds no second copy.
+    assert pc.sweep_stale_plugin_completions(events, now=time.time() + 130.0) == 0
+    assert events.qsize() == 1
+
+
+def test_an_abandoned_claim_is_reoffered_even_with_the_offer_marker_set(bound_session):
+    events = queue.Queue()
+    evt = _published_event(bound_session)
+    assert pc.claim_plugin_completion(evt["completion_id"], "dead:consumer") is True
+
+    assert pc.sweep_stale_plugin_completions(events, now=time.time() + 400.0) == 1
+    assert events.qsize() == 1

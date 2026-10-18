@@ -260,7 +260,7 @@ def publish_completion(
         }
         inserted = _insert_completion(completion_id, plugin_id, row, event_id, event, now)
         if not inserted:
-            existing = _existing_completion(plugin_id, row.session_key, event_id)
+            existing = _existing_completion(plugin_id, _conversation_id(tgt), event_id)
             # A concurrent publisher may have raced us to the row; report it, never queue twice.
             if existing is None:  # pragma: no cover - only a torn unique index could reach this
                 raise CompletionError("duplicate completion row could not be read back.")
@@ -298,7 +298,7 @@ def claim_plugin_completion(completion_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE plugin_completions
                   SET delivery_claim=?, delivery_claimed_at=?, delivery_attempts=delivery_attempts+1,
-                      updated_at=?
+                      delivery_deferred_at=NULL, updated_at=?
                 WHERE completion_id=? AND delivery_state='pending'
                   AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (claim_id, now, now, completion_id, now - _CLAIM_LEASE_S))
@@ -316,7 +316,7 @@ def complete_plugin_completion(completion_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE plugin_completions
                   SET delivery_state='delivered', delivered_at=?, updated_at=?,
-                      delivery_claim=NULL, delivery_claimed_at=NULL
+                      delivery_claim=NULL, delivery_claimed_at=NULL, delivery_deferred_at=NULL
                 WHERE completion_id=? AND delivery_state='pending' AND delivery_claim=?""",
             (now, now, completion_id, claim_id))
         acked = cur.rowcount == 1
@@ -347,9 +347,10 @@ def release_plugin_completion(completion_id: str, claim_id: str) -> bool:
             return True
         cur = conn.execute(
             """UPDATE plugin_completions
-                  SET delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                  SET delivery_claim=NULL, delivery_claimed_at=NULL, delivery_deferred_at=?,
+                      updated_at=?
                 WHERE completion_id=? AND delivery_state='pending' AND delivery_claim=?""",
-            (now, completion_id, claim_id))
+            (now, now, completion_id, claim_id))
         released = cur.rowcount == 1
     if released:
         # The in-memory copy is gone and the row is pending: let a later sweep offer it again.
@@ -367,10 +368,10 @@ def defer_plugin_completion(completion_id: str, claim_id: str) -> bool:
             return False
         cur = conn.execute(
             """UPDATE plugin_completions
-                  SET delivery_claim=NULL, delivery_claimed_at=NULL,
+                  SET delivery_claim=NULL, delivery_claimed_at=NULL, delivery_deferred_at=?,
                       delivery_attempts=MAX(0, delivery_attempts-1), updated_at=?
                 WHERE completion_id=? AND delivery_state='pending' AND delivery_claim=?""",
-            (now, completion_id, claim_id))
+            (now, now, completion_id, claim_id))
         deferred = cur.rowcount == 1
     if deferred:
         # Deferred, not delivered: the copy this process offered is gone, so a later sweep (or a
@@ -438,23 +439,32 @@ def sweep_stale_plugin_completions(target_queue, *, now: Optional[float] = None)
     with _DB_LOCK, _transaction() as conn:
         if not _table_exists(conn):
             return 0
+        # Two distinct kinds of row need a fresh offer:
+        #   * an ABANDONED CLAIM -- the consumer died mid-injection; its queue copy is gone, so the
+        #     process-local offer marker must be replaced or the row waits for a restart;
+        #   * a DEFERRED row -- a consumer handed it back as undeliverable and there is no copy.
+        # A row that was never claimed is already sitting on a queue: re-offering it would grow
+        # duplicate copies of one event (three sweeps produced 2, 3, 4 copies).
         rows = conn.execute(
-            """SELECT completion_id, event_json, created_at FROM plugin_completions
+            """SELECT completion_id, event_json, created_at,
+                      (delivery_claim IS NOT NULL) AS abandoned
+                 FROM plugin_completions
                 WHERE delivery_state='pending' AND event_json IS NOT NULL
-                  AND updated_at < ? AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
+                  AND ((delivery_claim IS NOT NULL AND delivery_claimed_at < ?)
+                       OR (delivery_deferred_at IS NOT NULL AND delivery_deferred_at < ?))
                 ORDER BY created_at, completion_id""",
-            (now - _SWEEP_STALE_S, cutoff)).fetchall()
-        # The claim lease expired, so the copy offered by the previous consumer is dead (its
-        # process is gone or it stopped mid-injection). Re-offering must replace that process-local
-        # marker: otherwise a stale entry in _offered suppresses the sweep forever and the row
-        # only recovers on the next process restart.
-        return _offer_rows(conn, rows, target_queue, now, force=True)
+            (cutoff, now - _SWEEP_STALE_S)).fetchall()
+        abandoned = {row[0] for row in rows if row[3]}
+        return _offer_rows(conn, rows, target_queue, now, force=abandoned)
 
 
 def _offer_rows(conn, rows: Iterable[tuple], target_queue, now: float, *,
-                startup: bool = False, force: bool = False) -> int:
+                startup: bool = False, force: Iterable[str] = ()) -> int:
     home, offered = hermes_home_key(get_hermes_home()), 0
-    for completion_id, payload, created_at in rows:
+    force = set(force)
+    for row in rows:
+        completion_id, payload, created_at = row[0], row[1], row[2]
+        abandoned = bool(row[3]) if len(row) > 3 else False
         if created_at and (now - created_at) > _MAX_REPLAY_AGE_S:
             conn.execute(
                 """UPDATE plugin_completions SET delivery_state='dropped', updated_at=?,
@@ -473,8 +483,13 @@ def _offer_rows(conn, rows: Iterable[tuple], target_queue, now: float, *,
             logger.warning("Plugin completion %s has an unreadable payload; dropping it.",
                            completion_id)
             continue
-        if not _mark_offered(home, completion_id, force=force):
+        if not _mark_offered(home, completion_id, force=completion_id in force):
             continue
+        if len(row) > 3 and not abandoned:
+            # This deferred row is on a queue again; do not let the next sweep add another copy.
+            conn.execute(
+                "UPDATE plugin_completions SET delivery_deferred_at=NULL WHERE completion_id=?",
+                (completion_id,))
         evt["restored"] = True
         if startup:
             # A first-drain replay has no in-process owner: a surface must prove ownership of this
@@ -668,6 +683,16 @@ def _insert_target(target: CompletionTarget) -> None:
              target.profile, target.created_at, target.expires_at))
 
 
+def _conversation_id(target: CompletionTarget) -> str:
+    """Dedup identity of the CONVERSATION a target belongs to.
+
+    A TUI tab carries ``ui_session_id``; a CLI or gateway conversation carries ``session_id``.
+    Context compression keeps the id; ``/new`` starts a different one. Only a bare chat route with
+    no conversation id falls back to ``session_key``, where dedup stays chat-wide as before.
+    """
+    return target.ui_session_id or target.session_id or target.session_key or ""
+
+
 def _load_target(target_id: str) -> Optional[CompletionTarget]:
     with _DB_LOCK, _transaction() as conn:
         if not _schema_ready(conn):
@@ -688,15 +713,16 @@ def _insert_completion(
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """INSERT OR IGNORE INTO plugin_completions
-                   (completion_id, target_id, plugin_id, session_key, event_id, event_json,
-                    created_at, updated_at, delivery_state, delivery_attempts)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)""",
-            (completion_id, target.target_id, plugin_id, target.session_key, event_id, payload,
-             now, now))
+                   (completion_id, target_id, plugin_id, session_key, conversation_id, event_id,
+                    event_json, created_at, updated_at, delivery_state, delivery_attempts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)""",
+            (completion_id, target.target_id, plugin_id, target.session_key,
+             _conversation_id(target), event_id, payload, now, now))
         return cur.rowcount == 1
 
 
-def _existing_completion(plugin_id: str, session_key: str, event_id: str) -> Optional[dict[str, Any]]:
+def _existing_completion(plugin_id: str, conversation_id: str,
+                         event_id: str) -> Optional[dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         if not _table_exists(conn):
             return None
@@ -704,8 +730,8 @@ def _existing_completion(plugin_id: str, session_key: str, event_id: str) -> Opt
             """SELECT completion_id, plugin_id, event_id, delivery_state, delivery_attempts,
                       created_at, delivered_at
                  FROM plugin_completions
-                WHERE plugin_id=? AND session_key=? AND event_id=?""",
-            (plugin_id, session_key, event_id)).fetchone()
+                WHERE plugin_id=? AND conversation_id=? AND event_id=?""",
+            (plugin_id, conversation_id, event_id)).fetchone()
     if row is None:
         return None
     keys = ("completion_id", "plugin_id", "event_id", "delivery_state", "delivery_attempts",

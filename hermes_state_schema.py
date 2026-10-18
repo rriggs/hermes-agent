@@ -1361,6 +1361,12 @@ def apply_declared_schema(cursor: sqlite3.Cursor) -> None:
     shim._reconcile_columns(cursor)
     SessionSchemaMixin._execute_ddl_script_transactional(cursor, SCHEMA_SQL)
     shim._reconcile_columns(cursor)
+    # Indexes that name a reconciled column cannot live in SCHEMA_SQL (a legacy table lacks the
+    # column when the script runs). SessionDB's full init creates them from DEFERRED_INDEX_SQL, but
+    # raw state.db callers (plugin completions, async delegation) only come through here.
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_completions_dedup "
+        "ON plugin_completions(plugin_id, conversation_id, event_id)")
 
 
 def reconcile_state_schema(conn: sqlite3.Connection) -> None:

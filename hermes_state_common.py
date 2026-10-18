@@ -721,6 +721,9 @@ CREATE TABLE IF NOT EXISTS plugin_completions (
     target_id TEXT NOT NULL,
     plugin_id TEXT NOT NULL,
     session_key TEXT NOT NULL DEFAULT '',
+    -- The CONVERSATION the target belonged to (ui session / session id, falling back to the chat
+    -- key). Dedup is per conversation: context compression keeps it, /new changes it.
+    conversation_id TEXT NOT NULL DEFAULT '',
     event_id TEXT NOT NULL,
     event_json TEXT,
     created_at REAL NOT NULL,
@@ -729,6 +732,9 @@ CREATE TABLE IF NOT EXISTS plugin_completions (
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     delivery_claim TEXT,
     delivery_claimed_at REAL,
+    -- Set when a consumer returns the row as pending (refused or undeliverable): the orphan sweep
+    -- re-offers it after the stale window. NULL means "no live copy needs re-offering".
+    delivery_deferred_at REAL,
     delivered_at REAL
 );
 
@@ -752,10 +758,7 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
--- Deduplication identity for plugin completions: the same event id may be re-published for the same
--- session (a restarted watcher re-observing a terminal peer state) and must notify only once.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_completions_dedup
-    ON plugin_completions(plugin_id, session_key, event_id);
+-- The dedup index lives in DEFERRED_INDEX_SQL: it keys on conversation_id, a later-added column.
 CREATE INDEX IF NOT EXISTS idx_plugin_completions_delivery
     ON plugin_completions(delivery_state, created_at);
 """
@@ -767,6 +770,14 @@ CREATE INDEX IF NOT EXISTS idx_plugin_completions_delivery
 # otherwise dies on the bare FK with no hint. It prints the RAISE text verbatim and buckets errors by phrase,
 # so the text must stay free of the words it reads as storage damage, lock contention or disk trouble.
 DEFERRED_INDEX_SQL = """
+-- Deduplication identity for plugin completions: the same event id may be re-published for the same
+-- CONVERSATION (a restarted watcher re-observing a terminal peer state) and must notify only once.
+-- Keyed on conversation_id, not the chat's session_key: /new starts a conversation that has never
+-- seen the event, and treating that publish as a duplicate would drop it silently. Recreated here
+-- because the column is added by _reconcile_columns.
+DROP INDEX IF EXISTS idx_plugin_completions_dedup;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plugin_completions_dedup
+    ON plugin_completions(plugin_id, conversation_id, event_id);
 DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard;
 CREATE TRIGGER IF NOT EXISTS sessions_runtime_ledger_delete_guard
 BEFORE DELETE ON sessions
