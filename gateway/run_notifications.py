@@ -795,8 +795,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     logger.exception("Plugin completion claim failed; returning the event")
                     if is_plugin:
                         from agent.plugin_completions import mark_offer_returned
+                        # Deferred and returned, NOT requeued: the sweep re-offers it after the
+                        # stale window, and requeueing here would put two copies on the queue.
                         mark_offer_returned(str(evt.get("completion_id") or ""))
-                    completion_queue.put(evt)
+                    else:
+                        completion_queue.put(evt)
                     continue
                 if is_plugin and claim is None:
                     continue  # another consumer owns this row; its copy is the one to deliver

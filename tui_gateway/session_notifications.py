@@ -539,6 +539,11 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         claim = claim_event_delivery(evt, "tui-poller")
     except Exception as exc:  # shared ledger busy/unreadable: the durable row stays pending and replays
         _notif_log_failure("notification delivery claim failed", exc)
+        if evt.get("type") == "plugin_completion":
+            # The queue copy is already gone. Without returning the offer the row has no claim
+            # and no deferred marker, so the sweep cannot recover it until a restart.
+            from tools.async_delegation import return_completion_offer
+            return_completion_offer(evt)
         claim = None
     if claim is None:
         # Another consumer holds the durable row — a gateway sharing this home claims before it verifies

@@ -93,6 +93,34 @@ def test_a_failed_claim_on_the_suppressed_path_returns_the_offer(bound, monkeypa
         "a claim failure must leave the row recoverable in the same process")
 
 
+def test_a_failed_claim_with_notifications_on_returns_the_offer(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  background_process_notifications: on\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tokens = set_session_vars(platform="tui", source="tui", chat_id="1", chat_type="dm",
+                              session_key=SESSION_KEY, session_id=SESSION_ID)
+    try:
+        evt = _publish_event()
+        monkeypatch.setattr(server, "_session_owns_notification_event", lambda *a: True)
+        monkeypatch.setattr(server, "_notif_claim_turn", lambda session: True)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("ledger busy")
+
+        monkeypatch.setattr("tools.async_delegation.claim_event_delivery", boom)
+        registry = SimpleNamespace(completion_queue=queue.Queue(),
+                                   is_completion_consumed=lambda session_id: False)
+
+        assert server._notif_handle_event(
+            "sid", _session(tmp_path), evt, set(), registry, lambda e: "text", None) is True
+
+        row = pc._existing_completion(PLUGIN, SESSION_ID, "task-1:completed")
+        assert row is not None and row["delivery_state"] == "pending"
+        assert pc.sweep_stale_plugin_completions(queue.Queue(), now=time.time() + 120.0) == 1
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_a_deferred_plugin_completion_is_not_also_requeued(bound, monkeypatch):
     """Deferred means the sweep re-offers the row; a requeued copy would duplicate it."""
     calls: list = []

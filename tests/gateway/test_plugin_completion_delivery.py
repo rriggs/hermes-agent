@@ -338,8 +338,7 @@ async def test_a_failed_claim_returns_the_event_and_does_not_lose_the_batch(
     await runner._drain_watch_notifications(events)
 
     assert adapter.handle_message.await_count == 1, "the sibling event must still be delivered"
-    requeued = events.get_nowait()
-    assert requeued["completion_id"] == first["completion_id"]
+    assert events.empty(), "the event is deferred, not requeued (one retry owner)"
     row = pc._existing_completion(PLUGIN, SESSION_ID, "task-7:completed")
     assert row is not None and row["delivery_state"] == "pending"
     # ... and the sweep can recover it without a restart.
