@@ -794,10 +794,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     # has to stay eligible for the sweep. Siblings are handled by this loop.
                     logger.exception("Plugin completion claim failed; returning the event")
                     if is_plugin:
-                        from agent.plugin_completions import mark_offer_returned
+                        from agent.plugin_completions import return_plugin_completion_offer
                         # Deferred and returned, NOT requeued: the sweep re-offers it after the
                         # stale window, and requeueing here would put two copies on the queue.
-                        mark_offer_returned(str(evt.get("completion_id") or ""))
+                        # Bound to the event's own profile: this process serves many profiles.
+                        return_plugin_completion_offer(evt)
                     else:
                         completion_queue.put(evt)
                     continue

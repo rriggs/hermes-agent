@@ -261,6 +261,9 @@ def publish_completion(
             "metadata": meta,
             "created_at": now,
             **{name: getattr(row, name) for name in _ROUTE_FIELDS},
+            # Owner scope: the queue is process-wide while the ledger is per profile, so a
+            # consumer in another profile must know which ledger a returned offer belongs to.
+            "profile_home": row.profile_home,
         }
         inserted = _insert_completion(completion_id, plugin_id, row, event_id, event, now)
         if not inserted:
@@ -410,9 +413,20 @@ def return_plugin_completion_offer(evt: Mapping[str, Any]) -> None:
     Clearing the process-local offer is not enough: the sweep only selects abandoned claims and
     rows marked deferred, so a discarded startup copy would otherwise wait for another restart.
     Mark the row deferred so the next sweep re-offers it.
+
+    The queue is process-wide while the ledger is per profile, so the write is bound to the
+    profile that OWNS the event: a shutting-down consumer in another profile must not stamp its
+    own state.db and leave the owner's row invisible to recovery.
     """
-    completion_id = str((evt or {}).get("completion_id") or "")
-    if completion_id:
+    evt = evt or {}
+    completion_id = str(evt.get("completion_id") or "")
+    if not completion_id:
+        return
+    home = str(evt.get("profile_home") or "")
+    if home:
+        with _profile_scope(home):
+            mark_offer_returned(completion_id)
+    else:
         mark_offer_returned(completion_id)
 
 
@@ -473,23 +487,32 @@ def sweep_stale_plugin_completions(target_queue, *, now: Optional[float] = None)
         # duplicate copies of one event (three sweeps produced 2, 3, 4 copies).
         rows = conn.execute(
             """SELECT completion_id, event_json, created_at,
-                      (delivery_claim IS NOT NULL) AS abandoned
+                      (delivery_claim IS NOT NULL) AS abandoned, delivery_claim
                  FROM plugin_completions
                 WHERE delivery_state='pending' AND event_json IS NOT NULL
                   AND ((delivery_claim IS NOT NULL AND delivery_claimed_at < ?)
                        OR (delivery_deferred_at IS NOT NULL AND delivery_deferred_at < ?))
                 ORDER BY created_at, completion_id""",
             (cutoff, now - _SWEEP_STALE_S)).fetchall()
-        abandoned = {row[0] for row in rows if row[3]}
-        for completion_id in abandoned:
-            # The claim belongs to a consumer that died; clearing it means the re-offered copy is
-            # the only live one. Without this every sweep re-offers the same row again.
-            conn.execute(
-                """UPDATE plugin_completions
-                      SET delivery_claim=NULL, delivery_claimed_at=NULL
-                    WHERE completion_id=? AND delivery_state='pending'""",
-                (completion_id,))
+        abandoned = {row[0] for row in rows if row[3] and _clear_stale_claim(conn, row[0], row[4])}
         return _offer_rows(conn, rows, target_queue, now, force=abandoned)
+
+
+def _clear_stale_claim(conn: sqlite3.Connection, completion_id: str, claim: Any) -> bool:
+    """Clear an expired claim ONLY if it is still the claim this sweep selected.
+
+    Selection and recovery are two statements, and another process may re-claim the row between
+    them. Clearing unconditionally erases that live claim and re-offers a second copy, so the
+    update is fenced on the exact claim value: True means this sweep owns the recovery.
+    """
+    if not claim:
+        return False
+    cur = conn.execute(
+        """UPDATE plugin_completions
+              SET delivery_claim=NULL, delivery_claimed_at=NULL
+            WHERE completion_id=? AND delivery_state='pending' AND delivery_claim=?""",
+        (completion_id, claim))
+    return cur.rowcount == 1
 
 
 def _offer_rows(conn, rows: Iterable[tuple], target_queue, now: float, *,
@@ -811,9 +834,25 @@ def _prune() -> None:
     with _DB_LOCK, _transaction() as conn:
         if not _table_exists(conn):
             return
+        # A delivered row is a dedup TOMBSTONE, and dedup is conversation-scoped. It may only be
+        # dropped (or have its payload cleared) once no publishable target remains in its
+        # conversation, or a target captured late would let the same event deliver twice.
+        delivered_cutoff = time.time() - _DELIVERED_RETENTION_SECONDS
+        live_target = """EXISTS (SELECT 1 FROM plugin_completion_targets t
+                                 WHERE COALESCE(NULLIF(t.ui_session_id, ''),
+                                                NULLIF(t.session_id, ''), t.session_key)
+                                       = plugin_completions.conversation_id
+                                   AND (t.expires_at IS NULL OR t.expires_at >= ?))"""
         conn.execute(
-            "DELETE FROM plugin_completions WHERE delivery_state='delivered' AND updated_at<?",
-            (time.time() - _DELIVERED_RETENTION_SECONDS,))
+            f"""UPDATE plugin_completions SET event_json=NULL
+                 WHERE delivery_state='delivered' AND event_json IS NOT NULL
+                   AND updated_at<? AND {live_target}""",
+            (delivered_cutoff, time.time()))
+        conn.execute(
+            f"""DELETE FROM plugin_completions
+                 WHERE delivery_state='delivered' AND updated_at<?
+                   AND NOT {live_target}""",
+            (delivered_cutoff, time.time()))
         # A dropped row keeps its dedup key but not its payload: the event can never deliver, and
         # its content must not sit in state.db for the retention window.
         conn.execute(

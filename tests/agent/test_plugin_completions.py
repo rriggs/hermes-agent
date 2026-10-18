@@ -195,6 +195,82 @@ def test_a_released_claim_is_retryable_and_a_deferred_one_spends_no_attempt(boun
 
 # ── restart replay ──────────────────────────────────────────────────────────
 
+def test_a_sweep_never_clears_a_claim_that_changed_after_its_selection(bound_session):
+    """Selection and recovery are separate statements; the recovery is fenced on the claim."""
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    pc.publish_completion("a2a", target=target, event_id="task-1:done", content="x")
+    row = pc._existing_completion("a2a", SESSION_ID, "task-1:done")
+
+    with pc._DB_LOCK, pc._transaction() as conn:
+        conn.execute(
+            "UPDATE plugin_completions SET delivery_claim='stale', delivery_claimed_at=0 "
+            "WHERE completion_id=?", (row["completion_id"],))
+        # ... another process re-claims the row after this sweep selected the stale claim.
+        conn.execute(
+            "UPDATE plugin_completions SET delivery_claim='live', delivery_claimed_at=? "
+            "WHERE completion_id=?", (pc.time.time(), row["completion_id"]))
+        assert pc._clear_stale_claim(conn, row["completion_id"], "stale") is False
+
+    with pc._DB_LOCK, pc._transaction() as conn:
+        claim = conn.execute(
+            "SELECT delivery_claim FROM plugin_completions WHERE completion_id=?",
+            (row["completion_id"],)).fetchone()[0]
+    assert claim == "live", "the sweep must not erase a claim another consumer just took"
+
+
+def test_returning_an_offer_writes_the_owners_ledger_not_the_callers(tmp_path, bound_session):
+    """The queue is process-wide, the ledger is per profile: return under the owner's scope."""
+    owner_home = tmp_path / "owner"
+    owner_home.mkdir()
+    with pc._profile_scope(str(owner_home)):
+        target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+        pc.publish_completion("a2a", target=target, event_id="task-2:done", content="x")
+
+    event = _queue_events()[-1]
+    assert event["profile_home"] == str(owner_home)
+
+    pc.return_plugin_completion_offer(event)  # caller runs in the test profile, not the owner's
+
+    with pc._profile_scope(str(owner_home)), pc._DB_LOCK, pc._transaction() as conn:
+        deferred = conn.execute(
+            "SELECT delivery_deferred_at FROM plugin_completions WHERE completion_id=?",
+            (event["completion_id"],)).fetchone()
+    assert deferred is not None and deferred[0] is not None, (
+        "the owner's row must become sweep-visible, or it is stranded until a restart")
+
+
+class _Clock:
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+    def __getattr__(self, name):
+        import time as _time
+        return getattr(_time, name)
+
+
+def test_a_tombstone_outlives_a_late_target_in_its_conversation(bound_session, monkeypatch):
+    """Dedup is conversation-scoped, so a tombstone must live as long as any target can publish."""
+    clock = _Clock(1_800_000_000.0)
+    monkeypatch.setattr(pc, "time", clock)
+
+    first = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    pc.publish_completion("a2a", target=first, event_id="task-3:done", content="x")
+    row = pc._existing_completion("a2a", SESSION_ID, "task-3:done")
+    assert pc.claim_plugin_completion(row["completion_id"], "consumer")
+    assert pc.complete_plugin_completion(row["completion_id"], "consumer")
+
+    clock.now += 29 * 86400  # same conversation, a fresh target, still inside its 30-day life
+    late = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    clock.now += 9 * 86400   # day 38: past the tombstone's own retention, target still live
+    pc._prune()
+
+    receipt = pc.publish_completion("a2a", target=late, event_id="task-3:done", content="x")
+    assert receipt["status"] == "duplicate", "a pruned tombstone would deliver the same event twice"
+
+
 def test_a_pending_completion_replays_after_a_restart(bound_session):
     """The in-memory queue dies with the process; the durable row must re-offer on the next boot."""
     from tools.async_delegation import restore_undelivered_completions
