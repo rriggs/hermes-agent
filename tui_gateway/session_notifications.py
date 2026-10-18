@@ -505,8 +505,8 @@ def _notif_sweep_plugin_completions(queue) -> None:
     try:
         from agent.plugin_completions import sweep_stale_plugin_completions
         sweep_stale_plugin_completions(queue)
-    except Exception as exc:  # a sweep failure must never stop the notification poller
-        _notif_log_failure("plugin completion sweep failed", exc)
+    except Exception:  # a sweep failure must never stop the notification poller
+        logger.exception("plugin completion sweep failed")
 
 
 def _notif_defer_event(evt, claim, put=None):
