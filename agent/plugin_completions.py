@@ -274,8 +274,14 @@ def publish_completion(
             logger.debug("Plugin %s completion %s for event %s already exists (%s)",
                          plugin_id, existing["completion_id"], event_id, existing["delivery_state"])
             return _receipt(existing, status="duplicate")
-        _prune()
+    # Offer FIRST: the row is committed, and a housekeeping failure must never turn an accepted
+    # publication into a raise. Accepting without a copy leaves retry returning "duplicate" while
+    # nothing is on the queue -- only a restart recovered that.
     _offer(event, tgt.profile_home)
+    try:
+        _prune()
+    except Exception:
+        logger.warning("Plugin completion ledger prune failed", exc_info=True)
     logger.info("Plugin %s published completion %s (event=%s, session_key=%s)",
                 plugin_id, completion_id, event_id, row.session_key or row.session_id)
     return {
@@ -794,6 +800,15 @@ def _insert_completion(
     """Insert one pending row; False when ``(plugin, session, event_id)`` already exists."""
     payload = json.dumps(dict(event), default=str)
     with _DB_LOCK, _transaction() as conn:
+        if not _table_exists(conn):
+            return False
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM plugin_completions WHERE delivery_state='pending'").fetchone()[0]
+        if pending >= _MAX_PENDING_ROWS:
+            # Refuse the NEW event rather than evicting an accepted one: a deleted pending row
+            # leaves its live queue copy unclaimable and destroys work already reported as queued.
+            raise CompletionError(
+                f"completion ledger is full ({pending} pending); retry after delivery")
         cur = conn.execute(
             """INSERT OR IGNORE INTO plugin_completions
                    (completion_id, target_id, plugin_id, session_key, conversation_id, event_id,
@@ -879,14 +894,9 @@ def _prune() -> None:
                        AND target_id NOT IN (SELECT target_id FROM plugin_completions
                                               WHERE delivery_state='pending'))""",
             (cutoff, cutoff))
-        count = conn.execute(
-            "SELECT COUNT(*) FROM plugin_completions WHERE delivery_state='pending'").fetchone()[0]
-        if count > _MAX_PENDING_ROWS:
-            conn.execute(
-                """DELETE FROM plugin_completions WHERE completion_id IN (
-                       SELECT completion_id FROM plugin_completions
-                        WHERE delivery_state='pending'
-                        ORDER BY created_at ASC LIMIT ?)""", (count - _MAX_PENDING_ROWS,))
+        # No capacity eviction here: deleting a pending row destroys work a plugin was told was
+        # accepted, and its live queue copy becomes unclaimable. Admission is refused at publish
+        # time instead (see publish_completion), which the caller can retry.
 
 
 def _decode_event(payload: str) -> Optional[dict[str, Any]]:

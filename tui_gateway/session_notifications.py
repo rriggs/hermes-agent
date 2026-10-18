@@ -539,12 +539,20 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         claim = claim_event_delivery(evt, "tui-poller")
     except Exception as exc:  # shared ledger busy/unreadable: the durable row stays pending and replays
         _notif_log_failure("notification delivery claim failed", exc)
+        # The caller already claimed the turn: every failure path must release it or the session
+        # stays busy, keeps its lease and never reaches its bot mailbox again.
+        _notif_release_turn(session)
         if evt.get("type") == "plugin_completion":
             # The queue copy is already gone. Without returning the offer the row has no claim
             # and no deferred marker, so the sweep cannot recover it until a restart.
             from tools.async_delegation import return_completion_offer
-            return_completion_offer(evt)
-        claim = None
+            try:
+                return_completion_offer(evt)
+            except Exception:
+                logger.exception("Could not mark the completion deferred; keeping its copy")
+                from tools.process_registry import process_registry
+                process_registry.completion_queue.put(evt)
+        return
     if claim is None:
         # Another consumer holds the durable row — a gateway sharing this home claims before it verifies
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
@@ -651,7 +659,14 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
                 # so the sweep can re-offer it, or it is stranded until a restart.
                 logger.exception("Suppressed plugin completion claim failed; returning the offer")
                 from tools.async_delegation import return_completion_offer
-                return_completion_offer(evt)
+                try:
+                    return_completion_offer(evt)
+                except Exception:
+                    # Still failing: keep the copy rather than lose it with no claim or marker.
+                    logger.exception("Could not mark the suppressed completion deferred; "
+                                     "keeping its copy")
+                    from tools.process_registry import process_registry
+                    process_registry.completion_queue.put(evt)
                 return True
             if claim is not None:
                 complete_event_delivery(evt, claim)

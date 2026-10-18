@@ -195,6 +195,36 @@ def test_a_released_claim_is_retryable_and_a_deferred_one_spends_no_attempt(boun
 
 # ── restart replay ──────────────────────────────────────────────────────────
 
+def test_a_prune_failure_does_not_leave_an_accepted_publication_unoffered(
+    bound_session, monkeypatch,
+):
+    """Housekeeping after an accepted insert must never raise before the copy is queued."""
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    monkeypatch.setattr(pc, "_prune", lambda: (_ for _ in ()).throw(RuntimeError("disk full")))
+
+    receipt = pc.publish_completion("a2a", target=target, event_id="task-6:done", content="x")
+
+    assert receipt["status"] == "queued"
+    assert [e["event_id"] for e in _queue_events()] == ["task-6:done"]
+
+
+def test_the_pending_cap_refuses_new_work_instead_of_deleting_accepted_work(
+    bound_session, monkeypatch,
+):
+    monkeypatch.setattr(pc, "_MAX_PENDING_ROWS", 2)
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    for i in range(2):
+        pc.publish_completion("a2a", target=target, event_id=f"task-7:{i}", content="x")
+
+    with pytest.raises(pc.CompletionError):
+        pc.publish_completion("a2a", target=target, event_id="task-7:2", content="x")
+
+    events = _queue_events()
+    assert len(events) == 2, "the accepted copies must still be on the queue"
+    assert all(pc.claim_plugin_completion(e["completion_id"], "c") for e in events), (
+        "evicting an accepted row would leave its queue copy unclaimable")
+
+
 def test_a_sweep_never_clears_a_claim_that_changed_after_its_selection(bound_session):
     """Selection and recovery are separate statements; the recovery is fenced on the claim."""
     target = pc.capture_completion_target("a2a", session_id=SESSION_ID)

@@ -121,6 +121,35 @@ def test_a_failed_claim_with_notifications_on_returns_the_offer(monkeypatch, tmp
         clear_session_vars(tokens)
 
 
+def test_a_double_ledger_failure_keeps_the_copy_and_releases_the_turn(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  background_process_notifications: on\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tokens = set_session_vars(platform="tui", source="tui", chat_id="1", chat_type="dm",
+                              session_key=SESSION_KEY, session_id=SESSION_ID)
+    try:
+        evt = _publish_event()
+        session = _session(tmp_path)
+        monkeypatch.setattr(server, "_session_owns_notification_event", lambda *a: True)
+        monkeypatch.setattr(server, "_notif_claim_turn", lambda s: s.update(running=True) or True)
+        monkeypatch.setattr("tools.async_delegation.claim_event_delivery",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("busy")))
+        monkeypatch.setattr("tools.async_delegation.return_completion_offer",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("still busy")))
+        registry = SimpleNamespace(completion_queue=queue.Queue(),
+                                   is_completion_consumed=lambda sid: False)
+
+        assert server._notif_handle_event(
+            "sid", session, evt, set(), registry, lambda e: "text", None) is True
+
+        assert session["running"] is False, "the turn must not stay claimed for a busy session"
+        from tools.process_registry import process_registry
+        assert process_registry.completion_queue.qsize() == 1, (
+            "with both ledger writes failing, the copy is the only way to retry")
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_a_deferred_plugin_completion_is_not_also_requeued(bound, monkeypatch):
     """Deferred means the sweep re-offers the row; a requeued copy would duplicate it."""
     calls: list = []
