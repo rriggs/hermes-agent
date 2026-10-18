@@ -785,7 +785,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # database, so a secondary profile's completion is never delivered and its real row
             # stays pending with zero attempts.
             async with self._completion_event_scope(evt):
-                claim = _plugin_completion_claim(evt, f"gateway-watch:{id(self)}") if is_plugin else None
+                try:
+                    claim = (_plugin_completion_claim(evt, f"gateway-watch:{id(self)}")
+                             if is_plugin else None)
+                except Exception:
+                    # A failed claim must not take the batch with it: this drain already removed
+                    # every event from the queue, so the failing one has to go back and its row
+                    # has to stay eligible for the sweep. Siblings are handled by this loop.
+                    logger.exception("Plugin completion claim failed; returning the event")
+                    if is_plugin:
+                        from agent.plugin_completions import mark_offer_returned
+                        mark_offer_returned(str(evt.get("completion_id") or ""))
+                    completion_queue.put(evt)
+                    continue
                 if is_plugin and claim is None:
                     continue  # another consumer owns this row; its copy is the one to deliver
                 from tools.process_registry_notifications import should_surface_notification

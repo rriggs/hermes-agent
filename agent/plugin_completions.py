@@ -412,16 +412,15 @@ def return_plugin_completion_offer(evt: Mapping[str, Any]) -> None:
     Mark the row deferred so the next sweep re-offers it.
     """
     completion_id = str((evt or {}).get("completion_id") or "")
-    if not completion_id:
-        return
-    _forget_offer(completion_id)
-    mark_offer_returned(completion_id)
+    if completion_id:
+        mark_offer_returned(completion_id)
 
 
 def mark_offer_returned(completion_id: str, *, now: Optional[float] = None) -> bool:
     """Make a pending row eligible for the sweep after its queued copy was discarded."""
     if not completion_id:
         return False
+    _forget_offer(completion_id)
     now = time.time() if now is None else now
     with _DB_LOCK, _transaction() as conn:
         if not _table_exists(conn):
@@ -815,6 +814,12 @@ def _prune() -> None:
         conn.execute(
             "DELETE FROM plugin_completions WHERE delivery_state='delivered' AND updated_at<?",
             (time.time() - _DELIVERED_RETENTION_SECONDS,))
+        # A dropped row keeps its dedup key but not its payload: the event can never deliver, and
+        # its content must not sit in state.db for the retention window.
+        conn.execute(
+            """UPDATE plugin_completions SET event_json=NULL
+                WHERE delivery_state='dropped' AND event_json IS NOT NULL AND updated_at<?""",
+            (cutoff,))
         # Prune targets by their own expiry, never by capture age: a target captured for a long
         # background watch is still live at day 7. Legacy rows (expires_at IS NULL) have no
         # declared expiry, so they are only aged out once nothing pending references them --

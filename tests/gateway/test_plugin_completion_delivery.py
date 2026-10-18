@@ -308,6 +308,64 @@ def test_a_target_is_publishable_for_thirty_days_and_pruned_by_expiry(bound_sess
     pc._prune()
     assert target_rows() == 0, "an expired target outlived its declared expiry"
 
+@pytest.mark.asyncio
+async def test_a_failed_claim_returns_the_event_and_does_not_lose_the_batch(
+    monkeypatch, tmp_path, bound_session,
+):
+    """The drain removes events from the queue first; a claim error must not strand them."""
+    runner = _build_runner(monkeypatch, tmp_path)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    events = queue.Queue()
+    first = _published_event(bound_session)
+    events.put(first)
+    second_target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
+    pc.publish_completion(PLUGIN, target=second_target, event_id="task-8:completed", content="two")
+    from tools.process_registry import process_registry
+    events.put(process_registry.completion_queue.get_nowait())
+
+    import gateway.run_notifications as rn
+    real_claim = rn._plugin_completion_claim
+    state = {"failed": False}
+
+    def flaky_claim(evt, consumer):
+        if not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError("sqlite busy")
+        return real_claim(evt, consumer)
+
+    monkeypatch.setattr(rn, "_plugin_completion_claim", flaky_claim)
+
+    await runner._drain_watch_notifications(events)
+
+    assert adapter.handle_message.await_count == 1, "the sibling event must still be delivered"
+    requeued = events.get_nowait()
+    assert requeued["completion_id"] == first["completion_id"]
+    row = pc._existing_completion(PLUGIN, SESSION_ID, "task-7:completed")
+    assert row is not None and row["delivery_state"] == "pending"
+    # ... and the sweep can recover it without a restart.
+    assert pc.sweep_stale_plugin_completions(queue.Queue(), now=time.time() + 120.0) == 1
+
+
+def test_a_dropped_completion_keeps_its_key_but_not_its_payload(bound_session, monkeypatch):
+    target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
+    pc.publish_completion(PLUGIN, target=target, event_id="task-5:done", content="x" * 30_000)
+    row = _row("task-5:done")
+    with sqlite3.connect(pc._db_path()) as con:
+        con.execute(
+            "UPDATE plugin_completions SET delivery_state='dropped', updated_at=? "
+            "WHERE completion_id=?", (time.time(), row["completion_id"]))
+
+    real = time.time()
+    monkeypatch.setattr(pc, "time", SimpleNamespace(time=lambda: real + 8 * 86400))
+    pc._prune()
+
+    with sqlite3.connect(pc._db_path()) as con:
+        payload, state = con.execute(
+            "SELECT event_json, delivery_state FROM plugin_completions WHERE completion_id=?",
+            (row["completion_id"],)).fetchone()
+    assert state == "dropped" and payload is None, "a dropped payload must not linger in state.db"
+
+
 def test_a_new_conversation_is_not_a_duplicate(monkeypatch, tmp_path):
     """/new keeps the chat's session_key; the completion must still reach the new conversation."""
     (tmp_path / "config.yaml").write_text(
