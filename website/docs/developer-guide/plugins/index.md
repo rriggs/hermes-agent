@@ -877,6 +877,10 @@ Guarantees and limits:
 - **Profile-scoped and owned.** A target binds to the plugin that captured it;
   publishing against another plugin's target, an unknown target or an expired
   one raises. A plugin cannot address an arbitrary session.
+- **Expires after 30 days.** A captured target is publishable for 30 days, then
+  publishing raises `CompletionTargetError`. Capture near the work, or capture a
+  fresh target when a long-lived watch is renewed; the target's `expires_at`
+  reports the deadline.
 - **Durable.** Pending events survive a restart and replay through the same
   policy; each delivery is claimed and acknowledged by exactly one consumer
   (CLI, TUI, or the messaging gateway), and retried when delivery is refused.

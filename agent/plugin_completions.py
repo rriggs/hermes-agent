@@ -69,6 +69,10 @@ _CLAIM_LEASE_S = 300.0
 # Pending completions older than this are dropped on replay instead of starting a turn nobody waits on.
 _MAX_REPLAY_AGE_S = 48 * 3600.0
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+# How long a captured target stays publishable. A plugin may legitimately hold a target across
+# hours of background work, so the default is generous; it is a real, enforced expiry (publish
+# raises ``CompletionTargetError`` after it) rather than a pruning accident.
+_DEFAULT_TARGET_TTL_S = 30 * 24 * 60 * 60
 _MAX_PENDING_ROWS = 2_000
 # Idle floor before the sweep re-offers a row whose claim lease expired.
 _SWEEP_STALE_S = 60.0
@@ -204,7 +208,7 @@ def capture_completion_target(
         profile_home=str(get_hermes_home().resolve()),
         profile=_active_profile_name(),
         created_at=now,
-        expires_at=None,
+        expires_at=now + _DEFAULT_TARGET_TTL_S,
         **_route_kwargs(route),
     )
     with _profile_scope(target.profile_home):
@@ -440,10 +444,15 @@ def sweep_stale_plugin_completions(target_queue, *, now: Optional[float] = None)
                   AND updated_at < ? AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                 ORDER BY created_at, completion_id""",
             (now - _SWEEP_STALE_S, cutoff)).fetchall()
-        return _offer_rows(conn, rows, target_queue, now)
+        # The claim lease expired, so the copy offered by the previous consumer is dead (its
+        # process is gone or it stopped mid-injection). Re-offering must replace that process-local
+        # marker: otherwise a stale entry in _offered suppresses the sweep forever and the row
+        # only recovers on the next process restart.
+        return _offer_rows(conn, rows, target_queue, now, force=True)
 
 
-def _offer_rows(conn, rows: Iterable[tuple], target_queue, now: float, *, startup: bool = False) -> int:
+def _offer_rows(conn, rows: Iterable[tuple], target_queue, now: float, *,
+                startup: bool = False, force: bool = False) -> int:
     home, offered = hermes_home_key(get_hermes_home()), 0
     for completion_id, payload, created_at in rows:
         if created_at and (now - created_at) > _MAX_REPLAY_AGE_S:
@@ -464,7 +473,7 @@ def _offer_rows(conn, rows: Iterable[tuple], target_queue, now: float, *, startu
             logger.warning("Plugin completion %s has an unreadable payload; dropping it.",
                            completion_id)
             continue
-        if not _mark_offered(home, completion_id):
+        if not _mark_offered(home, completion_id, force=force):
             continue
         evt["restored"] = True
         if startup:
@@ -727,7 +736,17 @@ def _prune() -> None:
             return
         conn.execute("DELETE FROM plugin_completions WHERE delivery_state='delivered' AND updated_at<?",
                      (cutoff,))
-        conn.execute("DELETE FROM plugin_completion_targets WHERE created_at<?", (cutoff,))
+        # Prune targets by their own expiry, never by capture age: a target captured for a long
+        # background watch is still live at day 7. Legacy rows (expires_at IS NULL) have no
+        # declared expiry, so they are only aged out once nothing pending references them --
+        # deleting one would turn a legitimate publish into "unknown completion target".
+        conn.execute(
+            """DELETE FROM plugin_completion_targets
+                WHERE (expires_at IS NOT NULL AND expires_at < ?)
+                   OR (expires_at IS NULL AND created_at < ?
+                       AND target_id NOT IN (SELECT target_id FROM plugin_completions
+                                              WHERE delivery_state='pending'))""",
+            (cutoff, cutoff))
         count = conn.execute(
             "SELECT COUNT(*) FROM plugin_completions WHERE delivery_state='pending'").fetchone()[0]
         if count > _MAX_PENDING_ROWS:
@@ -755,10 +774,10 @@ def _offer(event: Mapping[str, Any], profile_home: str) -> None:
     process_registry.completion_queue.put(dict(event))
 
 
-def _mark_offered(home: str, completion_id: str) -> bool:
+def _mark_offered(home: str, completion_id: str, *, force: bool = False) -> bool:
     with _offer_lock:
         key = (home, completion_id)
-        if key in _offered:
+        if key in _offered and not force:
             return False
         _offered.add(key)
         return True

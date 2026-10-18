@@ -14,7 +14,9 @@ Uses a real ``GatewayRunner`` with a fake transport, against the hermetic temp `
 
 from __future__ import annotations
 
+import contextlib
 import queue
+import sqlite3
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -198,3 +200,92 @@ async def test_a_claim_held_by_another_consumer_is_skipped(monkeypatch, tmp_path
     # The owning consumer still settles it.
     assert pc.complete_plugin_completion(evt["completion_id"], "tui:poller") is True
     assert _row()["delivery_state"] == "delivered"
+
+@pytest.mark.asyncio
+async def test_claim_inject_and_settle_all_run_in_the_owning_profile_scope(
+    monkeypatch, tmp_path, bound_session,
+):
+    """A secondary profile's row lives in ITS state.db; the launch scope would strand it."""
+    runner = _build_runner(monkeypatch, tmp_path)
+    events = queue.Queue()
+    events.put(_published_event(bound_session))
+    import gateway.run_notifications as rn
+
+    scope = {"active": False, "claim_in_scope": None, "settle_in_scope": None}
+
+    @contextlib.asynccontextmanager
+    async def recording_scope(evt):
+        scope["active"] = True
+        try:
+            yield
+        finally:
+            scope["active"] = False
+
+    monkeypatch.setattr(runner, "_completion_event_scope", recording_scope, raising=False)
+    real_claim, real_settle = rn._plugin_completion_claim, rn._settle_plugin_completion
+
+    def claim(evt, consumer):
+        scope["claim_in_scope"] = scope["active"]
+        return real_claim(evt, consumer)
+
+    def settle(evt, claim_id, operation):
+        scope["settle_in_scope"] = scope["active"]
+        return real_settle(evt, claim_id, operation)
+
+    monkeypatch.setattr(rn, "_plugin_completion_claim", claim)
+    monkeypatch.setattr(rn, "_settle_plugin_completion", settle)
+
+    await runner._drain_watch_notifications(events)
+
+    assert scope["claim_in_scope"] is True, (
+        "the claim ran outside the owning profile scope: it would hit the launch profile's ledger")
+    assert scope["settle_in_scope"] is True, (
+        "settlement ran outside the owning profile scope: the real row would stay pending")
+    assert _row()["delivery_state"] == "delivered"
+
+
+def test_a_stale_claim_is_reoffered_without_a_restart(bound_session):
+    """A consumer that dies while holding the claim must not strand the row until restart."""
+    events = queue.Queue()
+    evt = _published_event(bound_session)
+    assert pc.claim_plugin_completion(evt["completion_id"], "dead:consumer") is True
+
+    # Past the claim lease (300s) and the sweep's stale window (60s), same process, same _offered set.
+    reoffered = pc.sweep_stale_plugin_completions(events, now=time.time() + 400.0)
+
+    assert reoffered == 1, "the process-local offer marker suppressed the stale-claim sweep"
+    assert events.qsize() == 1
+    assert _row()["delivery_state"] == "pending"
+
+
+def test_a_target_is_publishable_for_thirty_days_and_pruned_by_expiry(bound_session, monkeypatch):
+    target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
+    assert target.expires_at is not None
+    assert target.expires_at > time.time() + 29 * 86400
+
+    base = time.time()
+
+    def at(offset: float) -> None:
+        monkeypatch.setattr(pc, "time", SimpleNamespace(time=lambda: base + offset))
+
+    def target_rows() -> int:
+        with sqlite3.connect(pc._db_path()) as con:
+            return con.execute(
+                "SELECT COUNT(*) FROM plugin_completion_targets WHERE target_id=?",
+                (target.target_id,)).fetchone()[0]
+
+    # Day 8 is past the ledger's 7-day row retention, but the target was captured for a long watch.
+    at(8 * 86400)
+    pc._prune()
+    assert target_rows() == 1, "a live target was pruned by capture age"
+
+    at(31 * 86400)
+    with pytest.raises(pc.CompletionTargetError):
+        pc.publish_completion(PLUGIN, target=target, event_id="late", content="too late")
+    pc._prune()
+    assert target_rows() == 1, "an expired target is kept through its retention grace window"
+
+    # Expiry plus the ledger's retention grace: long enough to explain the failure, then gone.
+    at(38 * 86400)
+    pc._prune()
+    assert target_rows() == 0, "an expired target outlived its declared expiry"

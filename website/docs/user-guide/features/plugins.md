@@ -1051,6 +1051,8 @@ or the messaging gateway). It never interrupts a running turn.
   after a restart cannot notify twice.
 - Pending events survive a restart and replay; each one is claimed and acknowledged by
   exactly one consumer and retried when delivery is refused.
+- A captured target expires after 30 days; `publish_completion()` then raises
+  `CompletionTargetError`. Capture near the work rather than persisting a target forever.
 - `capture_completion_target()` raises `CompletionDeliveryUnsupported` where no later turn
   can reach the session (one-shot `hermes -q`/`-z`, cron, Kanban or managed workers,
   stateless API sessions). Poll synchronously on those surfaces.

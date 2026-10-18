@@ -778,11 +778,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 # The owning session id the admission gate requires. It is the target's captured
                 # session id (a core-owned value written at capture time), never plugin input.
                 evt = {**evt, "parent_session_id": str(evt.get("session_id") or "")}
-            claim = _plugin_completion_claim(evt, f"gateway-watch:{id(self)}") if is_plugin else None
-            if is_plugin and claim is None:
-                continue  # another consumer owns this row; its copy is the one to deliver
             delivered = None
+            # Claim, inject and settle ALL inside the owning profile's scope: the ledger this row
+            # lives in is the target profile's state.db, and this process may be serving another
+            # profile's launch context. Outside the scope the claim lands in the launch profile's
+            # database, so a secondary profile's completion is never delivered and its real row
+            # stays pending with zero attempts.
             async with self._completion_event_scope(evt):
+                claim = _plugin_completion_claim(evt, f"gateway-watch:{id(self)}") if is_plugin else None
+                if is_plugin and claim is None:
+                    continue  # another consumer owns this row; its copy is the one to deliver
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt) or self._load_background_notifications_mode() == "off":
                     # Drained, claimed and acknowledged like any completion -- only the turn-starting
@@ -802,20 +807,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     except Exception:
                         logger.exception("Watch notification injection error")
                         delivered = False
-            # The original event: a requeued tick folds again from what is still queued.
-            if delivered is False:
-                if is_plugin:
-                    # The surface refused a retryable delivery: keep the row pending without
-                    # spending an attempt. Do NOT requeue it immediately -- a deterministic
-                    # refusal (malformed or unowned target) would spin this drain every tick.
-                    # The stale sweep re-offers the row once its claim lease expires.
-                    _settle_plugin_completion(evt, claim, "defer")
-                    continue
-                completion_queue.put(evt)
-            elif is_plugin:
-                # No route is not a delivery: hand the row back as pending (bounded by its attempt
-                # budget) rather than acking a completion no session ever received.
-                _settle_plugin_completion(evt, claim, "release" if delivered is None else "complete")
+                # The original event: a requeued tick folds again from what is still queued.
+                if delivered is False:
+                    if is_plugin:
+                        # The surface refused a retryable delivery: keep the row pending without
+                        # spending an attempt. Do NOT requeue it immediately -- a deterministic
+                        # refusal (malformed or unowned target) would spin this drain every tick.
+                        # The stale sweep re-offers the row once its claim lease expires.
+                        _settle_plugin_completion(evt, claim, "defer")
+                    else:
+                        completion_queue.put(evt)
+                elif is_plugin:
+                    # No route is not a delivery: hand the row back as pending (bounded by its
+                    # attempt budget) rather than acking a completion no session ever received.
+                    _settle_plugin_completion(evt, claim, "release" if delivered is None else "complete")
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
