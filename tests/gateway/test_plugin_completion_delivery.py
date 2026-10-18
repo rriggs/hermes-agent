@@ -15,6 +15,7 @@ Uses a real ``GatewayRunner`` with a fake transport, against the hermetic temp `
 from __future__ import annotations
 
 import queue
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -142,7 +143,29 @@ async def test_a_refused_delivery_is_deferred_without_spending_an_attempt(
     row = _row()
     assert row["delivery_state"] == "pending"
     assert row["delivery_attempts"] == 0, "a refusal must not spend a delivery attempt"
-    assert events.qsize() == 1, "the event is re-offered for a later route"
+    # No immediate requeue: a deterministic refusal would spin this drain every tick. The stale
+    # sweep re-offers the row once its claim lease expires.
+    assert events.qsize() == 0
+
+    from agent.plugin_completions import sweep_stale_plugin_completions
+    reoffered = sweep_stale_plugin_completions(events, now=time.time() + 120.0)
+    assert reoffered == 1 and events.qsize() == 1
+
+
+def test_a_plugin_completion_has_a_local_admission_identity_and_card(bound_session):
+    """The gateway-hosted CLI/Desktop path needs both, or local delivery is refused as invalid_params."""
+    from gateway.run_notifications import _local_completion_card
+
+    event = _published_event(bound_session)
+    runner = object.__new__(GatewayRunner)
+    identity = runner._completion_delivery_identity(event)
+    assert identity and identity[0] == "plugin_completion", (
+        "the local admission path rejects an event without a producer identity")
+    from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND
+    card = _local_completion_card(event)
+    assert card["display_kind"] == PROCESS_COMPLETE_DISPLAY_KIND
+    assert "plugin a2a" in card["display_text"]
+    assert "Peer finished task 7." in card["display_text"]
 
 
 @pytest.mark.asyncio

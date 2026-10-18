@@ -346,7 +346,11 @@ def release_plugin_completion(completion_id: str, claim_id: str) -> bool:
                   SET delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                 WHERE completion_id=? AND delivery_state='pending' AND delivery_claim=?""",
             (now, completion_id, claim_id))
-        return cur.rowcount == 1
+        released = cur.rowcount == 1
+    if released:
+        # The in-memory copy is gone and the row is pending: let a later sweep offer it again.
+        _forget_offer(completion_id)
+    return released
 
 
 def defer_plugin_completion(completion_id: str, claim_id: str) -> bool:
@@ -363,7 +367,12 @@ def defer_plugin_completion(completion_id: str, claim_id: str) -> bool:
                       delivery_attempts=MAX(0, delivery_attempts-1), updated_at=?
                 WHERE completion_id=? AND delivery_state='pending' AND delivery_claim=?""",
             (now, completion_id, claim_id))
-        return cur.rowcount == 1
+        deferred = cur.rowcount == 1
+    if deferred:
+        # Deferred, not delivered: the copy this process offered is gone, so a later sweep (or a
+        # restarted watcher) must be allowed to offer the row again.
+        _forget_offer(completion_id)
+    return deferred
 
 
 def drop_plugin_completion(completion_id: str, claim_id: str) -> bool:

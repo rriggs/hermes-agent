@@ -123,6 +123,16 @@ def _local_completion_card(evt: dict) -> dict[str, str]:
                 "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
     if evt_type == "async_delegation":
         return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
+    if evt_type == "plugin_completion":
+        # The card a viewer paints for a result that arrived as a new turn: an idle classic CLI
+        # only opens a turn that carries one, so a plugin completion without a card would be
+        # admitted and never surfaced there. It uses the generic background-completion kind rather
+        # than inventing a display kind the CLI/TUI/Desktop renderers do not know; the text names
+        # the plugin, which is the part a reader needs.
+        from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND
+        headline = " ".join(str(evt.get("content") or "").split())[:160]
+        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
+                "display_text": f"plugin {evt.get('plugin_id') or 'unknown'}: {headline}"}
     if evt_type == "heartbeat":
         # The wake stays machinery (no bubble, and a quiet tick may end in silence); the receipt lets an
         # idle CLI open the turn with one line and show the agent's reply.
@@ -764,6 +774,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # A plugin completion is a durable row, not an in-memory notice: claim it before
             # injecting so no other drain delivers the same event, and settle the claim by outcome.
             is_plugin = evt.get("type") == "plugin_completion"
+            if is_plugin and not evt.get("parent_session_id"):
+                # The owning session id the admission gate requires. It is the target's captured
+                # session id (a core-owned value written at capture time), never plugin input.
+                evt = {**evt, "parent_session_id": str(evt.get("session_id") or "")}
             claim = _plugin_completion_claim(evt, f"gateway-watch:{id(self)}") if is_plugin else None
             if is_plugin and claim is None:
                 continue  # another consumer owns this row; its copy is the one to deliver
@@ -791,9 +805,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
                 if is_plugin:
-                    # The surface refused a retryable delivery: keep the row pending for a later
-                    # route without spending an attempt, and let the sweep re-offer it.
+                    # The surface refused a retryable delivery: keep the row pending without
+                    # spending an attempt. Do NOT requeue it immediately -- a deterministic
+                    # refusal (malformed or unowned target) would spin this drain every tick.
+                    # The stale sweep re-offers the row once its claim lease expires.
                     _settle_plugin_completion(evt, claim, "defer")
+                    continue
                 completion_queue.put(evt)
             elif is_plugin:
                 # No route is not a delivery: hand the row back as pending (bounded by its attempt
@@ -970,6 +987,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 try:
                     await admit_process_notice(self, authority, adapter, synth_event, evt)
                 except RuntimeStoreError as exc:
+                    logger.debug("admit_process_notice refused %s", exc, exc_info=True)
                     raise WakeNotAccepted(str(exc)) from exc
             else:
                 await admit_internal_event(adapter, synth_event)
@@ -994,6 +1012,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
         """
         evt_type = str(evt.get("type") or "")
+        if evt_type == "plugin_completion":
+            # A plugin's completion row has its own durable identity (completion_id), and the local
+            # admission path requires a non-empty producer identity for every automation event:
+            # without this case a plugin completion addressed to a gateway-hosted CLI/Desktop
+            # session is refused as ``invalid_params`` and can never be delivered there.
+            completion_id = str(evt.get("completion_id") or "")
+            return (evt_type, completion_id, "") if completion_id else None
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
             if not producer_id:
