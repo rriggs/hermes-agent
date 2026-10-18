@@ -638,10 +638,17 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             # Suppressing the turn is not the same as leaving the durable row pending: an
             # unacknowledged row replays later and delivers a result the user switched off. Claim
             # and acknowledge exactly like the gateway's notifications-off path.
-            from tools.async_delegation import claim_event_delivery
-            claim = claim_event_delivery(evt, "tui-suppressed")
+            from tools.async_delegation import claim_event_delivery, complete_event_delivery
+            try:
+                claim = claim_event_delivery(evt, "tui-suppressed")
+            except Exception:
+                # The event was already taken off the queue: a ledger failure must hand it back
+                # so the sweep can re-offer it, or it is stranded until a restart.
+                logger.exception("Suppressed plugin completion claim failed; returning the offer")
+                from tools.async_delegation import return_completion_offer
+                return_completion_offer(evt)
+                return True
             if claim is not None:
-                from tools.async_delegation import complete_event_delivery
                 complete_event_delivery(evt, claim)
         return True
     if evt_type == "completion" and completions is not None:

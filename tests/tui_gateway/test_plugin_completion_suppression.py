@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -68,6 +69,28 @@ def test_off_acknowledges_the_durable_row_and_starts_no_turn(bound, monkeypatch)
     assert row is not None
     assert row["delivery_state"] == "delivered", (
         "a suppressed completion left pending replays later and delivers anyway")
+
+
+def test_a_failed_claim_on_the_suppressed_path_returns_the_offer(bound, monkeypatch):
+    evt = _publish_event()
+    monkeypatch.setattr(server, "_session_owns_notification_event", lambda *a: True)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("ledger busy")
+
+    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", boom)
+    registry = SimpleNamespace(completion_queue=queue.Queue(),
+                               is_completion_consumed=lambda session_id: False)
+
+    assert server._notif_handle_event(
+        "sid", _session(bound), evt, set(), registry, lambda e: "text", None) is True
+
+    row = pc._existing_completion(PLUGIN, SESSION_ID, "task-1:completed")
+    assert row is not None and row["delivery_state"] == "pending"
+    _now = time.time() + 120.0
+    assert pc.sweep_stale_plugin_completions(queue.Queue(), now=_now) == 1, (
+        "a claim failure must leave the row recoverable in the same process")
 
 
 def test_a_deferred_plugin_completion_is_not_also_requeued(bound, monkeypatch):
