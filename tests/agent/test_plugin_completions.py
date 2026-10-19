@@ -195,6 +195,40 @@ def test_a_released_claim_is_retryable_and_a_deferred_one_spends_no_attempt(boun
 
 # ── restart replay ──────────────────────────────────────────────────────────
 
+def test_a_repeatedly_abandoned_claim_is_dropped_at_the_attempt_cap(bound_session, monkeypatch):
+    """A consumer that dies holding its claim never settles; the sweep must still cap it."""
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    pc.publish_completion("a2a", target=target, event_id="task-9:done", content="x")
+    row = pc._existing_completion("a2a", SESSION_ID, "task-9:done")
+    from queue import Queue
+
+    monkeypatch.setattr(pc, "_CLAIM_LEASE_S", 0.0)
+    queue = Queue()
+    for _ in range(pc._MAX_DELIVERY_ATTEMPTS + 1):
+        if not pc.claim_plugin_completion(row["completion_id"], "dead-consumer"):
+            break
+        if pc.sweep_stale_plugin_completions(queue, now=pc.time.time() + 1) == 0:
+            break
+        queue.get_nowait()  # re-offered copy
+
+    with pc._DB_LOCK, pc._transaction() as conn:
+        state = conn.execute(
+            "SELECT delivery_state FROM plugin_completions WHERE completion_id=?",
+            (row["completion_id"],)).fetchone()[0]
+    assert state == "dropped", "an event no consumer can settle must not re-offer forever"
+
+
+def test_metadata_keys_are_redacted_too(bound_session):
+    secret = "ghp_" + "G" * 29
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    pc.publish_completion("a2a", target=target, event_id="task-10:done", content="done",
+                          metadata={secret: "value"})
+
+    event = _queue_events()[-1]
+    assert secret not in json.dumps(event["metadata"]), (
+        "keys are rendered as key=value too")
+
+
 def test_metadata_is_redacted_before_it_reaches_the_model(bound_session):
     """Metadata is rendered into the notification, so it gets the same redaction as content."""
     secret = "ghp_" + "F" * 29

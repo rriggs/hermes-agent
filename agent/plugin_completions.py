@@ -508,6 +508,21 @@ def sweep_stale_plugin_completions(target_queue, *, now: Optional[float] = None)
                 # NOT ours to re-offer, and it must not reach the replay/drop path either.
                 if not _clear_stale_claim(conn, row[0], row[4]):
                     continue
+                # A consumer that dies while holding its claim never reaches settlement, so the
+                # attempt cap must be enforced HERE or a poisoned event re-offers forever.
+                attempts = conn.execute(
+                    "SELECT delivery_attempts FROM plugin_completions WHERE completion_id=?",
+                    (row[0],)).fetchone()[0]
+                if attempts >= _MAX_DELIVERY_ATTEMPTS:
+                    conn.execute(
+                        """UPDATE plugin_completions
+                              SET delivery_state='dropped', updated_at=?, delivery_deferred_at=NULL
+                            WHERE completion_id=? AND delivery_state='pending'""",
+                        (now, row[0]))
+                    logger.warning("Plugin completion %s dropped after %d attempts",
+                                   row[0], attempts)
+                    _forget_offer(row[0])
+                    continue
                 abandoned.add(row[0])
             offerable.append(row)
         return _offer_rows(conn, offerable, target_queue, now, force=abandoned)
@@ -678,7 +693,9 @@ def _redact_metadata(value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_metadata(item) for item in value]
     if isinstance(value, Mapping):
-        return {key: _redact_metadata(item) for key, item in value.items()}
+        # Keys are rendered into the prompt as ``key=value`` too, so they get the same treatment.
+        return {_redact_metadata(str(key)): _redact_metadata(item)
+                for key, item in value.items()}
     return value
 
 
