@@ -195,6 +195,23 @@ def test_a_released_claim_is_retryable_and_a_deferred_one_spends_no_attempt(boun
 
 # ── restart replay ──────────────────────────────────────────────────────────
 
+def test_metadata_is_redacted_before_it_reaches_the_model(bound_session):
+    """Metadata is rendered into the notification, so it gets the same redaction as content."""
+    secret = "ghp_" + "F" * 29
+    target = pc.capture_completion_target("a2a", session_id=SESSION_ID)
+    receipt = pc.publish_completion(
+        "a2a", target=target, event_id="task-8:done", content="done",
+        metadata={"task_id": "task-8", "note": f"token {secret}", "nested": {"t": secret}})
+
+    event = _queue_events()[-1]
+    rendered = json.dumps(event["metadata"])
+
+    assert secret not in rendered
+    assert receipt["status"] == "queued"
+    row = pc._existing_completion("a2a", SESSION_ID, "task-8:done")
+    assert row is not None
+
+
 def test_a_prune_failure_does_not_leave_an_accepted_publication_unoffered(
     bound_session, monkeypatch,
 ):

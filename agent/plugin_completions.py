@@ -666,12 +666,27 @@ def _clean_content(content: Any) -> str:
         return content
 
 
+def _redact_metadata(value: Any) -> Any:
+    """Redact strings inside metadata: it is rendered into the model-facing notification."""
+    if isinstance(value, str):
+        try:
+            from agent.redact import redact_sensitive_text
+            return redact_sensitive_text(value)
+        except Exception:  # pragma: no cover - redaction is a guard, not a hard dependency
+            return value
+    if isinstance(value, list):
+        return [_redact_metadata(item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: _redact_metadata(item) for key, item in value.items()}
+    return value
+
+
 def _clean_metadata(metadata: Any) -> dict[str, Any]:
     if metadata is None:
         return {}
     if not isinstance(metadata, Mapping):
         raise CompletionRequestError("metadata must be a mapping.")
-    value = dict(metadata)
+    value = _redact_metadata(dict(metadata))
     try:
         encoded = json.dumps(value, sort_keys=True, default=str)
     except (TypeError, ValueError) as exc:
