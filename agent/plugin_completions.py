@@ -673,6 +673,7 @@ def _redact_metadata(value: Any) -> Any:
             from agent.redact import redact_sensitive_text
             return redact_sensitive_text(value)
         except Exception:  # pragma: no cover - redaction is a guard, not a hard dependency
+            logger.debug("Metadata redaction unavailable; publishing as given", exc_info=True)
             return value
     if isinstance(value, list):
         return [_redact_metadata(item) for item in value]
