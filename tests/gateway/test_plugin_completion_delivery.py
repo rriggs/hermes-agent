@@ -371,6 +371,32 @@ async def test_a_failing_recovery_write_keeps_the_copy_on_the_queue(
     assert events.qsize() == 1, "the drained event must go back when its row cannot be marked"
 
 
+@pytest.mark.asyncio
+async def test_a_settlement_failure_returns_the_rest_of_the_batch(
+    monkeypatch, tmp_path, bound_session,
+):
+    """Ack/defer/release run after the batch left the queue: their failure must not lose it."""
+    runner = _build_runner(monkeypatch, tmp_path)
+    events = queue.Queue()
+    first = _published_event(bound_session)
+    events.put(first)
+    second_target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
+    pc.publish_completion(PLUGIN, target=second_target, event_id="task-9:completed", content="two")
+    from tools.process_registry import process_registry
+    events.put(process_registry.completion_queue.get_nowait())
+
+    import gateway.run_notifications as rn
+
+    def failing_settle(evt, claim, action):
+        raise RuntimeError("sqlite busy")
+
+    monkeypatch.setattr(rn, "_settle_plugin_completion", failing_settle)
+
+    await runner._drain_watch_notifications(events)
+
+    assert events.qsize() == 2, "both the failing event and its untouched sibling must go back"
+
+
 def test_a_dropped_completion_keeps_its_key_but_not_its_payload(bound_session, monkeypatch):
     target = pc.capture_completion_target(PLUGIN, session_id=SESSION_ID)
     pc.publish_completion(PLUGIN, target=target, event_id="task-5:done", content="x" * 30_000)

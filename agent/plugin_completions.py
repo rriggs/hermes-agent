@@ -802,6 +802,12 @@ def _insert_completion(
     with _DB_LOCK, _transaction() as conn:
         if not _table_exists(conn):
             return False
+        existing = conn.execute(
+            """SELECT 1 FROM plugin_completions
+                WHERE plugin_id=? AND conversation_id=? AND event_id=?""",
+            (plugin_id, _conversation_id(target), event_id)).fetchone()
+        if existing is not None:
+            return False  # a duplicate retry is a receipt, never an admission decision
         pending = conn.execute(
             "SELECT COUNT(*) FROM plugin_completions WHERE delivery_state='pending'").fetchone()[0]
         if pending >= _MAX_PENDING_ROWS:

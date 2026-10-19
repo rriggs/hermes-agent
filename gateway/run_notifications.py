@@ -770,80 +770,94 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """
         from gateway.run import _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
-        for evt in watch_events:
-            # A plugin completion is a durable row, not an in-memory notice: claim it before
-            # injecting so no other drain delivers the same event, and settle the claim by outcome.
-            is_plugin = evt.get("type") == "plugin_completion"
-            if is_plugin and not evt.get("parent_session_id"):
-                # The owning session id the admission gate requires. It is the target's captured
-                # session id (a core-owned value written at capture time), never plugin input.
-                evt = {**evt, "parent_session_id": str(evt.get("session_id") or "")}
-            delivered = None
-            # Claim, inject and settle ALL inside the owning profile's scope: the ledger this row
-            # lives in is the target profile's state.db, and this process may be serving another
-            # profile's launch context. Outside the scope the claim lands in the launch profile's
-            # database, so a secondary profile's completion is never delivered and its real row
-            # stays pending with zero attempts.
-            async with self._completion_event_scope(evt):
-                try:
-                    claim = (_plugin_completion_claim(evt, f"gateway-watch:{id(self)}")
-                             if is_plugin else None)
-                except Exception:
-                    # A failed claim must not take the batch with it: this drain already removed
-                    # every event from the queue, so the failing one has to go back and its row
-                    # has to stay eligible for the sweep. Siblings are handled by this loop.
-                    logger.exception("Plugin completion claim failed; returning the event")
-                    returned = False
-                    if is_plugin:
-                        from agent.plugin_completions import return_plugin_completion_offer
-                        try:
-                            # Deferred and returned, NOT requeued: the sweep re-offers it after the
-                            # stale window, and requeueing here would put two copies on the queue.
-                            # Bound to the event's own profile: this process serves many profiles.
-                            return_plugin_completion_offer(evt)
-                            returned = True
-                        except Exception:
-                            # The ledger is still failing: keep the copy rather than strand the
-                            # completion with no claim and no deferred marker.
-                            logger.exception("Could not mark the completion deferred; keeping its copy")
-                    if not returned:
-                        completion_queue.put(evt)
-                    continue
-                if is_plugin and claim is None:
-                    continue  # another consumer owns this row; its copy is the one to deliver
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt) or self._load_background_notifications_mode() == "off":
-                    # Drained, claimed and acknowledged like any completion -- only the turn-starting
-                    # injection is suppressed, so the durable row must not stay pending.
-                    _settle_plugin_completion(evt, claim, "complete")
-                    continue
-                if evt.get("type") == "heartbeat":
-                    from gateway.session_automation import deliver_heartbeat
-                    delivered = await deliver_heartbeat(self, evt)
-                else:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        _settle_plugin_completion(evt, claim, "release")
-                        continue
+        for position, evt in enumerate(watch_events):
+            try:
+                await self._process_watch_event(evt, completion_queue)
+            except Exception:
+                # The whole batch was detached from the queue before processing. A ledger failure
+                # during settlement (ack/defer/release) must not strand the events behind this one:
+                # put this copy and every untouched sibling back so a later tick retries them.
+                logger.exception("Completion processing failed; returning the remaining copies")
+                for lost in watch_events[position:]:
+                    completion_queue.put(lost)
+                break
+
+    async def _process_watch_event(self, evt: dict, completion_queue) -> None:
+        """Deliver and settle ONE detached completion; never takes its siblings with it."""
+        from gateway.run import _format_gateway_process_notification
+        # A plugin completion is a durable row, not an in-memory notice: claim it before
+        # injecting so no other drain delivers the same event, and settle the claim by outcome.
+        is_plugin = evt.get("type") == "plugin_completion"
+        if is_plugin and not evt.get("parent_session_id"):
+            # The owning session id the admission gate requires. It is the target's captured
+            # session id (a core-owned value written at capture time), never plugin input.
+            evt = {**evt, "parent_session_id": str(evt.get("session_id") or "")}
+        delivered = None
+        # Claim, inject and settle ALL inside the owning profile's scope: the ledger this row
+        # lives in is the target profile's state.db, and this process may be serving another
+        # profile's launch context. Outside the scope the claim lands in the launch profile's
+        # database, so a secondary profile's completion is never delivered and its real row
+        # stays pending with zero attempts.
+        async with self._completion_event_scope(evt):
+            try:
+                claim = (_plugin_completion_claim(evt, f"gateway-watch:{id(self)}")
+                         if is_plugin else None)
+            except Exception:
+                # A failed claim must not take the batch with it: this drain already removed
+                # every event from the queue, so the failing one has to go back and its row
+                # has to stay eligible for the sweep. Siblings are handled by this loop.
+                logger.exception("Plugin completion claim failed; returning the event")
+                returned = False
+                if is_plugin:
+                    from agent.plugin_completions import return_plugin_completion_offer
                     try:
-                        delivered = await self._inject_watch_notification(synth_text, evt)
+                        # Deferred and returned, NOT requeued: the sweep re-offers it after the
+                        # stale window, and requeueing here would put two copies on the queue.
+                        # Bound to the event's own profile: this process serves many profiles.
+                        return_plugin_completion_offer(evt)
+                        returned = True
                     except Exception:
-                        logger.exception("Watch notification injection error")
-                        delivered = False
-                # The original event: a requeued tick folds again from what is still queued.
-                if delivered is False:
-                    if is_plugin:
-                        # The surface refused a retryable delivery: keep the row pending without
-                        # spending an attempt. Do NOT requeue it immediately -- a deterministic
-                        # refusal (malformed or unowned target) would spin this drain every tick.
-                        # The stale sweep re-offers the row once its claim lease expires.
-                        _settle_plugin_completion(evt, claim, "defer")
-                    else:
-                        completion_queue.put(evt)
-                elif is_plugin:
-                    # No route is not a delivery: hand the row back as pending (bounded by its
-                    # attempt budget) rather than acking a completion no session ever received.
-                    _settle_plugin_completion(evt, claim, "release" if delivered is None else "complete")
+                        # The ledger is still failing: keep the copy rather than strand the
+                        # completion with no claim and no deferred marker.
+                        logger.exception("Could not mark the completion deferred; keeping its copy")
+                if not returned:
+                    completion_queue.put(evt)
+                return
+            if is_plugin and claim is None:
+                return  # another consumer owns this row; its copy is the one to deliver
+            from tools.process_registry_notifications import should_surface_notification
+            if not should_surface_notification(evt) or self._load_background_notifications_mode() == "off":
+                # Drained, claimed and acknowledged like any completion -- only the turn-starting
+                # injection is suppressed, so the durable row must not stay pending.
+                _settle_plugin_completion(evt, claim, "complete")
+                return
+            if evt.get("type") == "heartbeat":
+                from gateway.session_automation import deliver_heartbeat
+                delivered = await deliver_heartbeat(self, evt)
+            else:
+                synth_text = _format_gateway_process_notification(evt)
+                if not synth_text:
+                    _settle_plugin_completion(evt, claim, "release")
+                    return
+                try:
+                    delivered = await self._inject_watch_notification(synth_text, evt)
+                except Exception:
+                    logger.exception("Watch notification injection error")
+                    delivered = False
+            # The original event: a requeued tick folds again from what is still queued.
+            if delivered is False:
+                if is_plugin:
+                    # The surface refused a retryable delivery: keep the row pending without
+                    # spending an attempt. Do NOT requeue it immediately -- a deterministic
+                    # refusal (malformed or unowned target) would spin this drain every tick.
+                    # The stale sweep re-offers the row once its claim lease expires.
+                    _settle_plugin_completion(evt, claim, "defer")
+                else:
+                    completion_queue.put(evt)
+            elif is_plugin:
+                # No route is not a delivery: hand the row back as pending (bounded by its
+                # attempt budget) rather than acking a completion no session ever received.
+                _settle_plugin_completion(evt, claim, "release" if delivered is None else "complete")
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
