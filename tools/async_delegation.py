@@ -359,7 +359,12 @@ def restore_undelivered_completions(target_queue) -> int:
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        return _replay_pending(conn, rows, target_queue, now, startup=True)
+        restored = _replay_pending(conn, rows, target_queue, now, startup=True)
+    # Plugin completions (agent/plugin_completions.py) live in their own table but the same profile
+    # state.db, so every caller that replays this profile's ledger replays theirs too: the CLI/TUI
+    # first-drain hook and the gateway's per-secondary pass both come through here.
+    from agent.plugin_completions import restore_pending_plugin_completions
+    return restored + restore_pending_plugin_completions(target_queue)
 
 
 def _replay_pending(conn, rows, target_queue, now: float, *, startup: bool = False) -> int:
@@ -503,14 +508,26 @@ def is_interim_delegation_event(evt: dict[str, Any]) -> bool:
 
 
 def claim_event_delivery(evt: dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events (and interim notices) need no token."""
+    """Claim a durable event; non-durable events (and interim notices) need no token.
+
+    Durability is per event type: a subagent result claims its ``async_delegations`` row, a plugin
+    completion claims its ``plugin_completions`` row. Both settle through the same consumer API so
+    every drain (CLI, TUI, gateway) claims and acknowledges without knowing the type.
+    """
     if is_interim_delegation_event(evt):
         return ""
+    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+    if evt.get("type") == "plugin_completion":
+        completion_id = str(evt.get("completion_id") or "")
+        if not completion_id:
+            return ""
+        from agent.plugin_completions import claim_plugin_completion
+        return claim_id if claim_plugin_completion(completion_id, claim_id) else None
     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
     if not delegation_id:
         return ""
-    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -620,6 +637,9 @@ def return_completion_offer(evt: dict[str, Any]) -> None:
     the durable row stays pending, e.g. a TUI session that cannot prove it owns the event drops it (every
     session poller drains one process-wide queue). The next sweep may offer the row again. Delegation ids
     are unique across profiles, so this clears the offer in every home."""
+    if evt.get("type") == "plugin_completion":
+        from agent.plugin_completions import return_plugin_completion_offer
+        return_plugin_completion_offer(evt)
     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
     if not delegation_id or is_interim_delegation_event(evt):
         return
@@ -627,8 +647,27 @@ def return_completion_offer(evt: dict[str, Any]) -> None:
         _offered.difference_update({key for key in _offered if key[1] == delegation_id})
 
 
+# Settlement function name -> the plugin-completion row operation it maps to. Table-driven so a new
+# consumer operation is one row here, never a type ladder at the call sites.
+_PLUGIN_DELIVERY_OPS = {
+    "complete_completion_delivery": "complete_plugin_completion",
+    "release_completion_delivery": "release_plugin_completion",
+    "defer_completion_delivery": "defer_plugin_completion",
+    "drop_completion_delivery": "drop_plugin_completion",
+}
+
+
 def _event_delivery(fn, evt: dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
+    if not claim_id:
+        return
+    if evt.get("type") == "plugin_completion":
+        completion_id = str(evt.get("completion_id") or "")
+        operation = _PLUGIN_DELIVERY_OPS.get(getattr(fn, "__name__", ""))
+        if completion_id and operation:
+            from agent import plugin_completions
+            getattr(plugin_completions, operation)(completion_id, claim_id)
+        return
+    if evt.get("type") == "async_delegation":
         fn(str(evt.get("delegation_id") or ""), claim_id)
 
 

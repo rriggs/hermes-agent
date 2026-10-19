@@ -101,7 +101,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     # requiring a current client prevents it from spending a full model turn unseen.
     # Shared peer membership excludes stdio, even when it is the real TUI RPC channel
     # (possibly wrapped for a dashboard sidecar), rather than a headless fallback sink.
-    if (evt.get("type") == "async_delegation" and evt.get("startup_replay")
+    if (evt.get("type") in {"async_delegation", "plugin_completion"} and evt.get("startup_replay")
             and not (_session_has_live_transport(session)
                      or (_stdio_is_rpc_channel and session.get("transport") is _stdio_transport))):
         return False
@@ -139,6 +139,9 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             task_idx = ((evt.get("results") or [{}])[0] or {}).get("task_index", "")
             return (evt.get("delegation_id", ""), evt_type, "task_failure", task_idx)
         return (evt.get("delegation_id", ""), evt_type)
+    if evt_type == "plugin_completion":
+        # One plugin can publish many results into one session; key each by its own identity.
+        return (evt.get("completion_id") or evt.get("event_id", ""), evt_type)
     extra = _DEDUP_EXTRA_FIELDS.get("watch_overflow_" if evt_type.startswith("watch_overflow_") else evt_type, ())
     return (evt.get("session_id", ""), evt_type, *(evt.get(f, 0 if f == "suppressed" else "") for f in extra))
 
@@ -149,6 +152,9 @@ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out
 # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
 # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+# Plugin-completion recovery is a ledger sweep, not a poll: once every 30s is plenty and keeps the
+# poller's 0.5s loop off the state.db write path.
+_PLUGIN_SWEEP_SECONDS = 30.0
 
 
 def _notif_release_turn(session: dict) -> None:
@@ -494,10 +500,25 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
                       **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
 
 
+def _notif_sweep_plugin_completions(queue) -> None:
+    """Re-offer plugin completions whose delivery claim expired (the TUI's periodic recovery)."""
+    try:
+        from agent.plugin_completions import sweep_stale_plugin_completions
+        sweep_stale_plugin_completions(queue)
+    except Exception:  # a sweep failure must never stop the notification poller
+        logger.exception("plugin completion sweep failed")
+
+
 def _notif_defer_event(evt, claim, put=None):
-    from tools.async_delegation import defer_completion_delivery
     from tools.process_registry import process_registry
-    if claim:
+    if claim and evt.get("type") == "plugin_completion":
+        from agent.plugin_completions import defer_plugin_completion
+        defer_plugin_completion(str(evt.get("completion_id") or ""), claim)
+        # Deferred means "the sweep re-offers this row". Requeueing this copy as well would put
+        # two live copies of one event on the queue (the sweep adds one after the stale window).
+        return
+    elif claim:
+        from tools.async_delegation import defer_completion_delivery
         defer_completion_delivery(evt['delegation_id'], claim)
     (put or process_registry.completion_queue.put)(evt)
 
@@ -518,7 +539,20 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         claim = claim_event_delivery(evt, "tui-poller")
     except Exception as exc:  # shared ledger busy/unreadable: the durable row stays pending and replays
         _notif_log_failure("notification delivery claim failed", exc)
-        claim = None
+        # The caller already claimed the turn: every failure path must release it or the session
+        # stays busy, keeps its lease and never reaches its bot mailbox again.
+        _notif_release_turn(session)
+        if evt.get("type") == "plugin_completion":
+            # The queue copy is already gone. Without returning the offer the row has no claim
+            # and no deferred marker, so the sweep cannot recover it until a restart.
+            from tools.async_delegation import return_completion_offer
+            try:
+                return_completion_offer(evt)
+            except Exception:
+                logger.exception("Could not mark the completion deferred; keeping its copy")
+                from tools.process_registry import process_registry
+                process_registry.completion_queue.put(evt)
+        return
     if claim is None:
         # Another consumer holds the durable row — a gateway sharing this home claims before it verifies
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
@@ -558,6 +592,13 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     queue = registry.completion_queue
     evt_type, is_delegation = evt.get("type", "completion"), evt.get("type") == "async_delegation"
     if not owned and _notification_event_belongs_elsewhere(sid, session, evt):
+        if evt_type == "plugin_completion" and deferred is not None:
+            # A plugin completion is a durable row, not a queue-owned notice. During a shutdown
+            # drain, mark it deferred so the sweep can re-offer it; appending it to a list that
+            # may be dropped would strand the row with no recovery path.
+            from tools.async_delegation import return_completion_offer
+            return_completion_offer(evt)
+            return True
         if deferred is not None:
             deferred.append(evt)
         else:  # otherwise a process started in session A surfaces in whichever poller wakes first
@@ -573,13 +614,18 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             (logger.warning if is_delegation and not restored else logger.debug)(
                 "Dropping unowned %s notification (origin=%r key=%r) instead of delivering to session %s",
                 evt_type, origin, key, sid)
-            if is_delegation:
+            if is_delegation or evt_type == "plugin_completion":
                 from tools.async_delegation import return_completion_offer
                 return_completion_offer(evt)
         elif is_delegation:
             deferred.append(evt)
         else:
-            logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
+            # Plugin completions are durable: hand the row back to the sweep instead of dropping
+            # the only copy (they are never appended to a shutdown deferred list).
+            from tools.async_delegation import return_completion_offer
+            logger.debug("Returning unowned %s notification during shutdown drain (origin=%r key=%r)",
+                         evt_type, origin, key)
+            return_completion_offer(evt)
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
@@ -601,6 +647,29 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     if evt_type != "async_delegation" and _background_notifications_off(session):
         # The user opted out of process-driven agent wakes: the status row above is the whole
         # delivery. Subagent results are not process notifications and still land.
+        if evt_type == "plugin_completion":
+            # Suppressing the turn is not the same as leaving the durable row pending: an
+            # unacknowledged row replays later and delivers a result the user switched off. Claim
+            # and acknowledge exactly like the gateway's notifications-off path.
+            from tools.async_delegation import claim_event_delivery, complete_event_delivery
+            try:
+                claim = claim_event_delivery(evt, "tui-suppressed")
+            except Exception:
+                # The event was already taken off the queue: a ledger failure must hand it back
+                # so the sweep can re-offer it, or it is stranded until a restart.
+                logger.exception("Suppressed plugin completion claim failed; returning the offer")
+                from tools.async_delegation import return_completion_offer
+                try:
+                    return_completion_offer(evt)
+                except Exception:
+                    # Still failing: keep the copy rather than lose it with no claim or marker.
+                    logger.exception("Could not mark the suppressed completion deferred; "
+                                     "keeping its copy")
+                    from tools.process_registry import process_registry
+                    process_registry.completion_queue.put(evt)
+                return True
+            if claim is not None:
+                complete_event_delivery(evt, claim)
         return True
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
@@ -695,11 +764,16 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     emitted = session.setdefault("_notification_emitted", set())
     handle = lambda events, deferred: _notif_handle_ready(
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
-    last_kanban_poll = last_loop_poll = 0.0
+    last_kanban_poll = last_loop_poll = last_plugin_sweep = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
         # Completions whose owner process died after this one started (#97202); throttled per profile home.
         async_delegation.maybe_sweep_orphaned_completions(queue)
+        # Plugin completions are a second durable ledger with the same failure mode: a consumer
+        # that died holding a claim leaves the row pending until something re-offers it.
+        if now - last_plugin_sweep >= _PLUGIN_SWEEP_SECONDS:
+            last_plugin_sweep = now
+            _notif_sweep_plugin_completions(queue)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:

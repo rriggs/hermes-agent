@@ -346,6 +346,15 @@ def snapshot_automation(authority, adapter, event, identity):
             or not isinstance(event.text, str) or not identity
             or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER
             or set(event.metadata) - _AUTOMATION_METADATA):
+        # The refusal is a bare code on the wire; name the failing condition so a producer that
+        # malformed an automation event can be fixed from the log instead of by guesswork.
+        logger.warning(
+            "automation admission refused (invalid_params): internal=%s type=%s command=%s "
+            "text=%s identity=%r media=%s prompt=%s platform=%s extra_metadata=%s",
+            event.internal, event.message_type, event.is_command(), type(event.text).__name__,
+            identity, bool(event.media_urls), event.prompt_response is not None,
+            event.source.platform,
+            sorted(set(event.metadata) - _AUTOMATION_METADATA))
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
                     | _tick_metadata(event.metadata))

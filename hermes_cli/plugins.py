@@ -58,6 +58,7 @@ from hermes_cli.plugins_dispatch import (
     is_valid_system_prompt_section_id, resolve_plugin_command_result,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
+from hermes_cli.plugins_session_delivery import PluginSessionDeliveryMixin
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
@@ -225,7 +226,7 @@ class LoadedPlugin:
     deferred: bool = False
 
 
-class PluginContext:
+class PluginContext(PluginSessionDeliveryMixin):
     """Facade given to plugins so they can register tools and hooks."""
 
     def __init__(self, manifest: PluginManifest, manager: PluginManager):
@@ -594,38 +595,6 @@ class PluginContext:
         # Pass THIS manager's profile-scoped config so a multi-profile process never consults the
         # active profile's consent state instead.
         return plugin_capability_granted(self.plugin_id, "tools.override", config=cfg)
-
-    # Fail-closed by construction: any failure to read consent state inside plugin_capability_granted
-    # returns False. The profile-scoped config is passed through so a multi-profile process consults THIS
-    # manager's home, never the active profile's (#65593 constraint).
-    def inject_message(
-        self, content: str, role: str = "user", *, session_key: str | None = None,
-        origin: Mapping[str, Any] | None = None,
-    ) -> bool:
-        """Queue *content* for a session (``session_key``) or a chat in this plugin's own profile
-        (``origin``); ``True`` means a host accepted it. Contract: plugins_injection.py, plugin docs."""
-        from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
-
-    def session_cwd(self) -> str:
-        """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""
-        from hermes_cli.plugin_session import context_cwd
-        return context_cwd(self._manager)
-
-    def session_surface(self) -> str:
-        """The calling session's client (``cli``/``tui``/``desktop``/``acp``) or messaging platform."""
-        from hermes_cli.plugin_session import context_surface
-        return context_surface(self._manager)
-
-    def _gateway_injection_allowed(self) -> bool:
-        """Return whether this plugin may trigger gateway session turns (read from the plugin's
-        own profile config, never the calling thread's ambient home)."""
-        try:
-            with _plugin_home_scope(self._manager.home_path):
-                cfg = load_config_readonly() or {}
-        except Exception:
-            return False
-        return (_plugin_settings_entry(cfg, self.plugin_id) or {}).get("allow_gateway_injection") is True
 
     @_serialized_replacement
     def register_cli_command(

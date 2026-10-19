@@ -316,6 +316,35 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_plugin_completion(evt: dict) -> str:
+    """A plugin's background result delivered as a new turn in the session that started it.
+
+    The plugin owns the content; this framing only adds provenance, so the agent can tell the
+    message apart from a user reply and knows which plugin published it. ``metadata`` is the
+    plugin's own structured detail (task id, peer state, ...), rendered compactly.
+    """
+    plugin_id = str(evt.get("plugin_id") or "unknown")
+    event_id = str(evt.get("event_id") or "?")
+    lines = [
+        f"[PLUGIN COMPLETION — {plugin_id}]",
+        "A plugin you invoked earlier finished background work and published this result to your "
+        "session. You may have moved on since then. Treat it as a new event: tell the user if it "
+        "changes what they should know, and absorb it silently if it does not.",
+    ]
+    created_at = evt.get("created_at")
+    if isinstance(created_at, (int, float)):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+        lines.append(f"Published: {stamp} ({_format_age(time.time() - created_at)} ago)")
+    lines.append(f"Source: plugin {plugin_id}   Event: {event_id}")
+    metadata = evt.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        detail = ", ".join(f"{key}={value}" for key, value in list(metadata.items())[:8])
+        if detail:
+            lines.append(f"Metadata: {detail[:500]}")
+    lines += ["--- RESULT ---", str(evt.get("content") or "")]
+    return "\n".join(lines)
+
+
 def async_delegation_display_text(evt: dict) -> str:
     """Compact UI title; the separate model notification retains all task evidence."""
     raw_results = evt.get("results")
@@ -470,6 +499,8 @@ def format_process_notification(evt: dict) -> str | None:
         return f"[IMPORTANT: {evt.get('message', '')}]"
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+    if evt_type == "plugin_completion":
+        return _format_plugin_completion(evt)
     _sid, _cmd = evt.get("session_id", "unknown"), evt.get("command", "unknown")
     _attribution = _delegation_attribution_line(evt)
     if evt.get("handoff_note"):

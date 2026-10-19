@@ -819,10 +819,8 @@ def test_gateway_drain_retains_and_formats_overflow_events():
     their summary — previously they were discarded at the drain (only
     watch_match/watch_disabled were retained) and had no formatter branch."""
     import asyncio
-    from gateway.run import (
-        _drain_gateway_watch_events,
-        _format_gateway_process_notification,
-    )
+    from gateway.run import _format_gateway_process_notification
+    from gateway.run_notifications import _drain_gateway_watch_events
 
     queue = asyncio.Queue()
     tripped = {
